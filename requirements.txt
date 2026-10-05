@@ -1,0 +1,12 @@
+# Runtime. rapidocr-onnxruntime has historically lagged new Python releases: use Python 3.10 - 3.12.
+mss
+numpy
+pillow
+rapidocr-onnxruntime
+keyboard
+pystray
+sv-ttk
+# Optional, source installs only (the installer build leaves it out because of its size):
+# ultralytics
+# Optional: keeps the sign-in token in the system keyring instead of a private file in your data folder
+# keyring
