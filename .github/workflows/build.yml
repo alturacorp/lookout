@@ -1,0 +1,92 @@
+name: build
+
+# Push a tag like v1.0.0 to build the installer and publish a release (including latest.json, the update feed).
+# Run it manually (Actions tab -> build -> Run workflow) to build without publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp into the build (e.g. 1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      PY_VERSION: "3.11"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Work out the version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") { $v = "${{ github.ref_name }}".TrimStart("v") } else { $v = "${{ inputs.version }}" }
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "Version '$v' must look like 1.2.3" }
+          "VERSION=$v" >> $env:GITHUB_ENV
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Fetch icons (Google Material Symbols)
+        run: python packaging/fetch_icons.py
+        continue-on-error: true      # the app builds fine without them (text-only buttons)
+
+      - name: Stamp version and update feed
+        run: python packaging/write_build_info.py --version $env:VERSION --feed "https://github.com/${{ github.repository }}/releases/latest/download/latest.json" --cloud-api-key "${{ vars.FIREBASE_API_KEY }}" --cloud-project "${{ vars.FIREBASE_PROJECT }}"
+
+      - name: Build the app (PyInstaller)
+        run: pyinstaller packaging/roblox_tracker.spec --noconfirm
+
+      - name: Self-test the built exe (loads the bundled OCR models)
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\Lookout\Lookout.exe -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content "$env:APPDATA\Lookout\logs\tracker.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
+          if ($p.ExitCode -ne 0) { throw "Self-test failed (exit code $($p.ExitCode))" }
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" }
+          & $iscc "/DAppVersion=$env:VERSION" packaging\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+
+      - name: Write the update feed
+        run: >
+          python packaging/write_feed.py --version $env:VERSION
+          --installer dist/Lookout-Setup-$env:VERSION.exe
+          --url "https://github.com/${{ github.repository }}/releases/download/v$env:VERSION/Lookout-Setup-$env:VERSION.exe"
+          --notes "Version $env:VERSION"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ env.VERSION }}
+          path: |
+            dist/Lookout-Setup-*.exe
+            dist/latest.json
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Lookout-Setup-*.exe
+            dist/latest.json
+          generate_release_notes: true
