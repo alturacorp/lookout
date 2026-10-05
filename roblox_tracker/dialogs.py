@@ -329,11 +329,14 @@ def settings_dialog(app):
         ttk.Label(f, text="(this build has no update feed configured)").grid(row=12, column=0, columnspan=2, sticky="w")
 
     box_scale, theme_var = tk.IntVar(d, app.prefs["box_scale"]), tk.StringVar(d, app.prefs["theme"])
+    keep_days = tk.IntVar(d, app.prefs["keep_days"])
     ttk.Label(f, text="Overlay and look", font=("Segoe UI", 10, "bold")).grid(row=13, column=0, columnspan=2, sticky="w", pady=(12, 0))
     ttk.Label(f, text="Avatar box size %").grid(row=14, column=0, sticky="w", pady=2)
     ttk.Spinbox(f, from_=50, to=200, increment=10, width=5, textvariable=box_scale).grid(row=14, column=1, sticky="w")
     ttk.Label(f, text="Theme (restart to apply)").grid(row=15, column=0, sticky="w", pady=2)
     ttk.Combobox(f, state="readonly", width=8, values=["dark", "light"], textvariable=theme_var).grid(row=15, column=1, sticky="w")
+    ttk.Label(f, text="Keep chat history for (days, 0 = forever)").grid(row=16, column=0, sticky="w", pady=2)
+    ttk.Spinbox(f, from_=0, to=3650, width=5, textvariable=keep_days).grid(row=16, column=1, sticky="w")
 
     def save():
         u, m = url.get().strip(), model.get().strip()
@@ -344,14 +347,18 @@ def settings_dialog(app):
             scale = min(200, max(50, int(box_scale.get())))
         except (tk.TclError, ValueError):
             scale = app.prefs["box_scale"]
-        app.prefs.update(ollama=u, model=m, tray=bool(use_tray.get()), auto_update=bool(auto_update.get()),
+        try:
+            keep = min(3650, max(0, int(keep_days.get())))
+        except (tk.TclError, ValueError):
+            keep = app.prefs["keep_days"]
+        app.prefs.update(keep_days=keep, ollama=u, model=m, tray=bool(use_tray.get()), auto_update=bool(auto_update.get()),
                          box_scale=scale, theme=theme_var.get())
         config.OLLAMA, config.MODEL = u, m
         app.apply_tray_pref()
         app.save_prefs()
         d.destroy()
     row = ttk.Frame(f)
-    row.grid(row=16, column=0, columnspan=2, pady=(12, 0))
+    row.grid(row=17, column=0, columnspan=2, pady=(12, 0))
     ttk.Button(row, text="Save", command=save).pack(side="left", padx=4)
     ttk.Button(row, text="Cancel", command=d.destroy).pack(side="left", padx=4)
 
@@ -448,7 +455,56 @@ def cloud_dialog(app):
     ttk.Button(row, text="Save", command=save).pack(side="left", padx=4)
     ttk.Button(row, text="Sync now", command=lambda: (app.sync.wake.set(), d.after(2500, describe))).pack(side="left", padx=4)
     ttk.Button(row, text="Close", command=d.destroy).pack(side="left", padx=4)
+    row2 = ttk.Frame(f)
+    row2.grid(row=9, column=0, columnspan=2, pady=(8, 0))
+    ttk.Button(row2, text="View the shared list…", command=lambda: watchlist_dialog(app)).pack(side="left", padx=4)
+    url = app.cloud.dashboard_url()
+    if url:
+        ttk.Button(row2, text="Open the dashboard", command=lambda: webbrowser.open(url)).pack(side="left", padx=4)
     describe()
+
+
+def watchlist_dialog(app):
+    """Read-only view of the local copy of the shared list: who is on it, why, and when the entry lapses."""
+    d = tk.Toplevel(app.root)
+    d.title("Shared watchlist")
+    d.attributes("-topmost", True)
+    f = ttk.Frame(d, padding=12)
+    f.pack(fill="both", expand=True)
+    q = tk.StringVar(d)
+    head = ttk.Label(f, text="", wraplength=560, justify="left")
+    head.pack(anchor="w")
+    ttk.Entry(f, textvariable=q, width=30).pack(anchor="e", pady=(0, 6))
+    cols = ("name", "cats", "sev", "by")
+    tv = ttk.Treeview(f, columns=cols, show="headings", height=14)
+    for c, t, w in (("name", "Player", 150), ("cats", "Categories", 220), ("sev", "Severity", 80), ("by", "Review by", 100)):
+        tv.heading(c, text=t)
+        tv.column(c, width=w)
+    tv.pack(fill="both", expand=True)
+    ttk.Label(f, text="This list is managed by reviewers in the dashboard. Use it to be aware and to report in-game; "
+                      "never to follow or confront anyone.", wraplength=560, justify="left", foreground="#555").pack(anchor="w", pady=6)
+
+    def fill(*_):
+        tv.delete(*tv.get_children())
+        rows = app.sync.watch_rows()
+        needle = q.get().strip().lower()
+        shown = 0
+        for r in rows:
+            cats = ", ".join(r["categories"])
+            if needle and needle not in (r["username"] + " " + cats).lower():
+                continue
+            by = datetime.fromtimestamp(r["review_by"] / 1000).strftime("%Y-%m-%d") if r["review_by"] else "-"
+            tv.insert("", "end", values=(r["username"], cats, r["severity"], by))
+            shown += 1
+        s = app.sync
+        head.config(text=f"{shown} of {len(rows)} shown  ·  {s.message}" +
+                    (f"  ·  last sync {datetime.fromtimestamp(s.last_ok):%H:%M:%S}" if s.last_ok else ""))
+    q.trace_add("write", fill)
+    fill()
+    row = ttk.Frame(f)
+    row.pack(pady=(4, 0))
+    ttk.Button(row, text="Refresh", command=lambda: (app.sync.wake.set(), d.after(2500, fill))).pack(side="left", padx=4)
+    ttk.Button(row, text="Close", command=d.destroy).pack(side="left", padx=4)
 
 
 def update_dialog(app, info):

@@ -19,7 +19,7 @@ from .cloud import PERMANENT, CloudError
 log = logging.getLogger("tracker")
 
 COOLDOWN = 10 * 60          # matches the backend: one sighting per watched player per 10 minutes
-POLL = 15                   # seconds between syncs
+POLL = 30                   # seconds between syncs. Each costs ~1.5 database reads: the free plan allows 50,000 a day in total
 HEARTBEAT = 5 * 60
 FLAG_MAX_AGE = 14 * 86400   # the backend deletes unreviewed flags after 14 days, so don't resend older ones
 OUTBOX_MAX = 500
@@ -37,7 +37,7 @@ class Sync:
         self.enabled, self.on_alert, self.on_status, self.clock = enabled, on_alert, on_status, clock
         self.state, self.message, self.last_ok = "off", "Not connected", 0
         self.wake = threading.Event()
-        self._spot, self._seen_sightings, self._last_beat, self._fails = {}, [], 0, 0
+        self._spot, self._seen_sightings, self._last_beat, self._fails, self._round = {}, [], 0, 0, 0
 
     # ------------------------------------------------------------ queueing (called by the app)
     def _enqueue(self, kind, payload):
@@ -70,18 +70,30 @@ class Sync:
 
     # ------------------------------------------------------------ the local copy
     def watch_row(self, user_id):
-        r = self.db.q("SELECT user_id,username,categories,severity FROM watchlist WHERE user_id=?", (str(user_id),))
+        r = self.db.q("SELECT user_id,username,categories,severity FROM watchlist WHERE user_id=? AND " + self._LIVE,
+                      (str(user_id), self._now_ms()))
         return self._row(r[0]) if r else None
+
+    def watch_rows(self):
+        """Everything live on the local copy, A-Z, for the viewer window."""
+        r = self.db.q("SELECT user_id,username,categories,severity,review_by FROM watchlist WHERE " + self._LIVE +
+                      " ORDER BY username COLLATE NOCASE", (self._now_ms(),))
+        return [dict(self._row(x), review_by=x[4]) for x in r]
 
     @staticmethod
     def _row(r):
         return {"user_id": r[0], "username": r[1], "categories": json.loads(r[2] or "[]"), "severity": r[3]}
 
+    _LIVE = "(review_by IS NULL OR review_by > ?)"      # an entry past its review date no longer counts
+
+    def _now_ms(self):
+        return self.clock() * 1000
+
     def watch_ids(self):
-        return {r[0] for r in self.db.q("SELECT user_id FROM watchlist")}
+        return {r[0] for r in self.db.q("SELECT user_id FROM watchlist WHERE " + self._LIVE, (self._now_ms(),))}
 
     def watch_count(self):
-        return self.db.scalar("SELECT COUNT(*) FROM watchlist")
+        return self.db.scalar("SELECT COUNT(*) FROM watchlist WHERE " + self._LIVE, (self._now_ms(),))
 
     def outbox_count(self):
         return self.db.scalar("SELECT COUNT(*) FROM outbox")
@@ -121,24 +133,24 @@ class Sync:
         if st.get("uid") and st["uid"] != self.cloud.uid:
             self.reset_cache()                                       # different account: don't mix lists
             st = {}
-        since, s_since = st.get("since", 0), st.get("sightingsSince")
+        since, s_since, meta = st.get("since", 0), st.get("sightingsSince"), st.get("metaRev")
         beat = did_beat = self.clock() - self._last_beat > HEARTBEAT
         sightings, server_time = [], self.clock() * 1000
-        for _ in range(MAX_PAGES):
-            out = self.cloud.call("syncWatchlist", {
-                "deviceId": self.device_id, "since": since, "sightingsSince": s_since,
-                "heartbeat": beat, "appVersion": build_info.VERSION})
-            beat = False
-            server_time = out.get("serverTime", server_time)
+        self._round += 1
+        out = self.cloud.call("syncWatchlist", {
+            "deviceId": self.device_id, "since": since, "sightingsSince": s_since, "metaRev": meta,
+            "wantSightings": self._round % 2 == 1 or self.clock() - max(self._spot.values(), default=0) < 120,
+            "heartbeat": beat, "appVersion": build_info.VERSION})
+        server_time = out.get("serverTime", server_time)
+        if not out.get("unchanged"):
             self._apply(out.get("players", []), out.get("fullList", False))
-            since = out.get("nextSince", since)
-            s_since = out.get("sightingsNext", s_since)
-            sightings += out.get("sightings", [])
-            if not out.get("hasMore"):
-                break
+            meta = out.get("metaRev", meta)
+        since = out.get("nextSince", since)
+        s_since = out.get("sightingsNext", s_since)
+        sightings += out.get("sightings", [])
         if did_beat:
             self._last_beat = self.clock()
-        self.db.put("sync_state", {"since": since, "sightingsSince": s_since, "uid": self.cloud.uid})
+        self.db.put("sync_state", {"since": since, "sightingsSince": s_since, "metaRev": meta, "uid": self.cloud.uid})
         self._alerts_from_others(sightings, server_time)
 
     def _apply(self, players, full=False):

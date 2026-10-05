@@ -39,7 +39,7 @@ The app can sync with the Firebase backend in `firebase/` (see its README). Buil
 project to `write_build_info.py` (`--cloud-api-key`, `--cloud-project`; CI reads the repository variables
 `FIREBASE_API_KEY` and `FIREBASE_PROJECT`). The web API key is an identifier, not a secret; access is controlled by the
 backend's roles. Without them the "Shared list…" window says the build isn't connected. For testing against another project,
-put `{"apiKey": "...", "projectId": "..."}` in `cloud.json` in the data folder.
+put `{"apiKey": "...", "projectId": "..."}` in `cloud.json` in the data folder (optionally `"dashboardUrl": "https://..."` if the dashboard is hosted somewhere other than `<project>.web.app`).
 
 ## Icons and theme
 Button icons are Google Material Symbols (https://fonts.google.com/icons). `python packaging/fetch_icons.py` downloads them and

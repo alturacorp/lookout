@@ -42,7 +42,7 @@ def _status_to_code(status):
 def load_config():
     """Project settings: env/`cloud.json` in the data folder (for testing against another project) beat the build's."""
     cfg = {"apiKey": getattr(build_info, "CLOUD_API_KEY", ""), "projectId": getattr(build_info, "CLOUD_PROJECT", ""),
-           "firestoreBase": "", "authBase": "", "tokenBase": ""}
+           "firestoreBase": "", "authBase": "", "tokenBase": "", "dashboardUrl": ""}
     try:
         with open(paths.data_path("cloud.json"), encoding="utf-8") as f:
             cfg.update({k: v for k, v in json.load(f).items() if k in cfg and isinstance(v, str)})
@@ -157,6 +157,13 @@ class Cloud:
     @property
     def ready(self):
         return configured(self.cfg)
+
+    def dashboard_url(self):
+        """Where the reviewers' web dashboard lives: cloud.json can override, otherwise Firebase Hosting's default."""
+        u = (self.cfg.get("dashboardUrl") or "").strip()
+        if not u and self.cfg.get("projectId"):
+            u = f"https://{self.cfg['projectId']}.web.app"
+        return u if u.startswith("https://") or u.startswith("http://127.0.0.1") else ""
 
     @property
     def signed_in(self):
@@ -313,17 +320,28 @@ class Cloud:
                 for r in (rows if isinstance(rows, list) else []) if "document" in r]
 
     def _sync(self, d):
+        """One poll. Costs one read when nothing changed: reviewers touch `meta/watchlist` in every commit that changes
+        the list, so the (larger) list is only fetched when that document's time has moved."""
         now_ms = int(self.clock() * 1000)
-        players = self._query("players", {"fieldFilter": {"field": {"fieldPath": "status"}, "op": "EQUAL",
-                                                          "value": {"stringValue": "watch"}}}, limit=1000)
-        out_players = [{"userId": p["userId"], "username": p.get("username", ""), "status": "watch",
-                        "categories": p.get("categories", []), "severity": p.get("severity", "normal"),
-                        "reviewBy": p.get("reviewBy"), "updatedAt": p.get("updatedAt", 0)}
-                       for p in players if (p.get("reviewBy") or 0) > now_ms]        # lapsed entries don't count
-        out = {"serverTime": now_ms, "players": out_players, "fullList": True, "hasMore": False,
-               "nextSince": d.get("since", 0), "sightings": [], "sightingsNext": d.get("sightingsSince") or now_ms}
+        try:
+            rev = dec(self._fs("/meta/watchlist", None, method="GET").get("fields", {})).get("updatedAt", 0)
+        except CloudError as e:
+            if e.code != "not-found":
+                raise
+            rev = 0                                           # nobody has ever been listed
+        out = {"serverTime": now_ms, "players": [], "hasMore": False, "nextSince": d.get("since", 0), "metaRev": rev,
+               "unchanged": rev == d.get("metaRev") and d.get("metaRev") is not None,
+               "sightings": [], "sightingsNext": d.get("sightingsSince") or now_ms}
+        if not out["unchanged"]:
+            players = self._query("players", {"fieldFilter": {"field": {"fieldPath": "status"}, "op": "EQUAL",
+                                                              "value": {"stringValue": "watch"}}}, limit=1000)
+            out["fullList"] = True
+            out["players"] = [{"userId": p["userId"], "username": p.get("username", ""), "status": "watch",
+                               "categories": p.get("categories", []), "severity": p.get("severity", "normal"),
+                               "reviewBy": p.get("reviewBy"), "updatedAt": p.get("updatedAt", 0)}
+                              for p in players if (p.get("reviewBy") or 0) > now_ms]        # lapsed entries don't count
         s_since = d.get("sightingsSince")
-        if s_since is not None:
+        if s_since is not None and d.get("wantSightings", True):
             rows = self._query("sightings", {"fieldFilter": {"field": {"fieldPath": "createdAt"}, "op": "GREATER_THAN_OR_EQUAL",
                                                              "value": {"timestampValue": iso(s_since)}}}, order="createdAt", limit=100)
             out["sightings"] = [{"id": r["id"], "userId": r["userId"], "username": r.get("username", ""), "at": r.get("createdAt", 0)}

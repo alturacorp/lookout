@@ -184,3 +184,17 @@ class Ease:
 
     def settled(self):
         return all(self.cur[k] == t for k, t in self.target.items())
+
+
+def frame_sig(frame):
+    """A tiny greyscale thumbnail of a screen grab, cheap to compare."""
+    import numpy as np
+    return np.asarray(frame[::24, ::24, :3], dtype=np.float32).mean(axis=2)
+
+
+def same_frame(a, b, tol=0.6):
+    """True if two signatures are practically the same picture (a paused game, a menu, an idle desktop)."""
+    if a is None or b is None or a.shape != b.shape:
+        return False
+    import numpy as np
+    return float(np.abs(a - b).mean()) < tol

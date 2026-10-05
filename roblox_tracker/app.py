@@ -8,6 +8,7 @@ import queue
 import re
 import threading
 import time
+import types
 import tkinter as tk
 import uuid
 from datetime import datetime, timedelta
@@ -26,7 +27,7 @@ from .ai import Clf, verdict
 from .config import (BUILTIN, CHAT_RE, CORNERS, CROP_EVERY, DEFAULT_AI_OFF, GRACE, IDLE_SECS, IMG, MIN_CONF,
                      MOVE_PX, NAME_RE, OV_SHARE, OV_TOP, SEEDS, now)
 from .overlay import Overlay, ShareView
-from .scene import Candidates, Ease, ListZones, find_lists, inside_any, plausible
+from .scene import Candidates, Ease, ListZones, find_lists, frame_sig, inside_any, plausible, same_frame
 from .store import Store
 from .sync import Sync
 from .textutil import download, file_owner, http, remove_file, skel
@@ -60,6 +61,11 @@ class App:
         self.ov_mode = tk.StringVar(root, value=p["ov_mode"])
         self.hud_corner = tk.StringVar(root, value=p["hud"])
         self.search = tk.StringVar(root)
+        # Worker threads must not touch Tk variables. They read this plain copy, which the UI thread keeps current.
+        self.opt = types.SimpleNamespace(auto=p["auto"], interval=p["interval"], discover=p["discover"], ai_on=p["ai_on"],
+                                          sens=p["sens"], mon=0)
+        for k in ("auto", "interval", "discover", "ai_on", "sens"):
+            getattr(self, k).trace_add("write", lambda *_, k=k: self._mirror(k))
         # pref key -> Tk variable, saved automatically whenever one changes
         self.pref_vars = {"auto": self.auto, "interval": self.interval, "ai_on": self.ai_on, "sens": self.sens,
                           "discover": self.discover, "auto_add": self.auto_add, "show_sus": self.show_sus, "ov_flags": self.ov_flags,
@@ -73,6 +79,7 @@ class App:
 
         # ---- runtime state (everything the scan thread touches must exist before the threads start)
         self.live, self.sel, self.track = set(), None, {}
+        self._tabs_sig, self._restoring = None, False
         self.names, self.pend, self.scan_n = set(), {}, 0
         self._sk, self.tag_seen, self.rr_left = None, set(), 0
         self.last_auto, self.fz, self.f1_t = {}, None, 0
@@ -114,6 +121,7 @@ class App:
             self.instance.listen(lambda: root.event_generate("<<ShowWindow>>", when="tail"))
         for target in (self.scan_loop, self.lookup_worker, self.ai_worker, lambda: self.sync.run(self.sync_stop)):
             threading.Thread(target=target, daemon=True).start()
+        root.after(20000, self.auto_purge)                 # tidy old chat/timeline rows (Settings: "Keep history")
         if not self.prefs["setup_done"]:
             root.after(1000, self.first_run)
         if self.prefs["auto_update"] and updater.feed_url() and time.time() - self.prefs["last_update_check"] > 20 * 3600:
@@ -167,6 +175,7 @@ class App:
         g = group(bar, "Scanning")
         self.mon = ttk.Combobox(g, state="readonly", width=11, values=[f"Monitor {i + 1}" for i in range(n)])
         self.mon.current(0)
+        self.mon.bind("<<ComboboxSelected>>", self._mirror_monitor)
         self.mon.pack(side="left")
         self.switch(g, "Auto-scan every", self.auto).pack(side="left", padx=(10, 4))
         ttk.Spinbox(g, from_=1, to=30, width=3, textvariable=self.interval).pack(side="left")
@@ -212,6 +221,10 @@ class App:
         bar3.pack(fill="x")
         self.status = ttk.Label(bar3, text="Loading OCR…")
         self.status.pack(side="left")
+        self.cloud_lbl = ttk.Label(bar3, text="", foreground="#666", cursor="hand2")
+        self.cloud_lbl.pack(side="left", padx=(16, 0))
+        self.cloud_lbl.bind("<Button-1>", lambda e: dialogs.watchlist_dialog(self) if self.cloud.signed_in else dialogs.cloud_dialog(self))
+        self.root.after(2000, self.update_cloud_label)
         self.search.trace_add("write", lambda *_: self.refresh())
         ttk.Entry(bar3, textvariable=self.search, width=24).pack(side="right")
         ttk.Label(bar3, text="Search players").pack(side="right", padx=6)
@@ -297,9 +310,31 @@ class App:
         else:
             self.root.geometry(f"{w}x{h}")
 
+    def auto_purge(self):
+        try:
+            n = self.db.purge(self.prefs.get("keep_days", 0))
+            if n:
+                log.info("auto-purge removed %d old chat/timeline rows", n)
+        except Exception:
+            log.exception("auto-purge failed")
+        self.root.after(24 * 3600 * 1000, self.auto_purge)
+
+    def _mirror(self, k):
+        try:
+            setattr(self.opt, k, getattr(self, k).get())
+        except tk.TclError:                                  # e.g. a spinbox that is momentarily empty
+            pass
+
+    def _mirror_monitor(self, *_):
+        try:
+            self.opt.mon = self.mon.current()
+        except tk.TclError:
+            pass
+
     def restore_monitor(self):
         n = len(self.mon.cget("values"))
         self.mon.current(self.prefs["monitor"] if self.prefs["monitor"] < n else 0)
+        self._mirror_monitor()
 
     def schedule_save(self):
         if self._save_job is None:
@@ -427,19 +462,34 @@ class App:
             now_s = st.get("state", "live") if name in self.live else ""
             ttags = tuple(t for t, c in (("live", name in self.live), ("flag", name in auto)) if c)
             self.tree.insert("", "end", iid=name, values=(name, alltags, last, now_s), tags=ttags)
-        if self.sel and self.tree.exists(self.sel):
-            self.tree.selection_set(self.sel)
-            self.fill_tabs()
-        keep = [s for s in sel if self.tree.exists(s)]
-        if len(keep) > 1:
-            self.tree.selection_set(keep)                  # keep multi-selections alive across the periodic refresh
+        self._restoring = True          # selection_set below fires <<TreeviewSelect>>; on_select must ignore it
+        try:
+            if self.sel and self.tree.exists(self.sel):
+                self.tree.selection_set(self.sel)
+                sig = self.tabs_signature(self.sel)
+                if sig != self._tabs_sig:                  # only touch the text boxes when there is something new
+                    self._tabs_sig = sig
+                    self.fill_tabs()
+            keep = [s for s in sel if self.tree.exists(s)]
+            if len(keep) > 1:
+                self.tree.selection_set(keep)              # keep multi-selections alive across the periodic refresh
+        finally:
+            self._restoring = False
         self.tree.yview_moveto(top)
 
+    def tabs_signature(self, name):
+        return (self.db.scalar("SELECT COUNT(*) FROM chat WHERE player=?", (name,)),
+                self.db.scalar("SELECT COUNT(*) FROM events WHERE player=?", (name,)),
+                self.db.scalar("SELECT COUNT(*), COALESCE(MAX(id),0), COUNT(DISTINCT status) FROM flags WHERE player=?", (name,)))
+
     def on_select(self, _):
+        if getattr(self, "_restoring", False):
+            return                      # the periodic refresh re-selecting a row: don't overwrite what's being typed
         s = self.tree.selection()
         if not s:
             return
         self.sel = s[0]
+        self._tabs_sig = None
         r = self.db.q("SELECT tags,notes,first_seen,last_seen,seen,verified,colours FROM players WHERE name=?", (self.sel,))[0]
         self.title.config(text=f"{self.sel}{'  ✓' if r[5] else ''}\nfirst {r[2]}\nlast  {r[3]}  ({r[4]} visits)\n{r[6]}")
         self.tags.delete(0, "end")
@@ -504,6 +554,24 @@ class App:
         if status == "confirmed":
             self.share_flag(fid)
         self.refresh()
+
+    def update_cloud_label(self):
+        """Small status in the main window: is the shared list on, who's watched, did the last sync work."""
+        try:
+            if not self.prefs["cloud_on"] or not self.cloud.ready:
+                txt = ""
+            elif not self.cloud.signed_in:
+                txt = "Shared list: sign in"
+            else:
+                s = self.sync
+                ok = {"ok": f"{s.watch_count()} on shared list", "offline": "shared list offline (retrying)",
+                      "denied": "shared list: waiting for approval", "auth": "shared list: sign in again"}
+                txt = ok.get(s.state, s.message)
+            if txt != self.cloud_lbl.cget("text"):
+                self.cloud_lbl.config(text=txt)
+        except Exception:
+            pass
+        self.root.after(5000, self.update_cloud_label)
 
     def device_id(self):
         """Random id for this installation, used by the backend only to avoid alerting a device about its own sightings."""
@@ -646,17 +714,24 @@ class App:
     def scan_loop(self):
         ocr = self.ocr = RapidOCR()
         self.root.after(0, lambda: self.status.config(text="Ready"))
+        last_sig, last_full = None, 0.0
         with mss.mss() as sct:
             while True:
-                self.trigger.wait(timeout=max(1, self.interval.get()))
+                self.trigger.wait(timeout=max(1, self.opt.interval))
                 forced = self.trigger.is_set()
                 self.trigger.clear()
-                if not (forced or self.auto.get()):
+                if not (forced or self.opt.auto):
                     continue
                 try:
-                    frame = np.array(sct.grab(sct.monitors[self.mon.current() + 1]))[:, :, :3]
+                    frame = np.array(sct.grab(sct.monitors[self.opt.mon + 1]))[:, :, :3]
+                    sig = frame_sig(frame)
+                    # A screen that hasn't changed has nothing new to read. Re-read at least every 20 s anyway.
+                    if not forced and same_frame(sig, last_sig) and time.time() - last_full < 20:
+                        continue
+                    last_sig, last_full = sig, time.time()
                     res, _ = ocr(frame)
-                    self.process(frame, res or [])
+                    with self.db.batch():
+                        self.process(frame, res or [])
                 except Exception as e:
                     self.log_error("scan", "scan failed")
                     self.root.after(0, lambda e=e: self.status.config(text=f"Error: {e}"))
@@ -692,12 +767,12 @@ class App:
             t = self.pick_name(frame, bx, t, conf)
             raw[self.canon(t)] = bx
         self.chat_lines(boxes, ignored, known, bool(rects))
-        pb = self.detector(frame) if self.discover.get() else []
+        pb = self.detector(frame) if self.opt.discover else []
         tags = {}
         for n, bx in raw.items():
             if n in known or any(near(bx, p) for p in pb) or self.cand_state.get(n) == "ok":
                 tags[n] = bx
-            elif self.discover.get() and plausible(n):
+            elif self.opt.discover and plausible(n):
                 self.cands.seen(n, bx, self.scan_n)          # not a player yet: watch it, check it's a real account
                 self.consider(n)
         self.cands.prune(self.scan_n)
@@ -822,7 +897,7 @@ class App:
         for cat, pats in self.lexicon.items():
             if any(re.search(p, msg, re.I) for p in pats):
                 self.db.q("INSERT INTO flags(chat_id,player,cat,src,t) VALUES(?,?,?,?,?)", (cid, who, cat, "lexicon", now()))
-        if self.ai_on.get():
+        if self.opt.ai_on:
             self.ai_jobs.put((cid, who, msg))
 
     # ---- presence / movement tracking
@@ -1018,7 +1093,7 @@ class App:
                 self.root.after(0, lambda e=e: self.status.config(text=f"AI: {e}"))
 
     def judge(self, cid, who, msg):
-        res = verdict(msg, self.db.q("SELECT text,label FROM examples"), self.clf, self.sens.get() / 100, self.ai_off)
+        res = verdict(msg, self.db.q("SELECT text,label FROM examples"), self.clf, self.opt.sens / 100, self.ai_off)
         if not res:
             return
         cat, conf = res

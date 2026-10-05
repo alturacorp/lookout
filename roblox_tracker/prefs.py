@@ -9,7 +9,7 @@ DEFAULTS = {
     "geometry": "1150x680", "ollama": OLLAMA, "model": MODEL, "tray": False, "setup_done": False,
     "auto_update": True, "last_update_check": 0, "skip_version": "",
     "cloud_on": False, "cloud_submit": True,
-    "auto_add": True, "box_scale": 100, "theme": "dark",
+    "auto_add": True, "box_scale": 100, "theme": "dark", "keep_days": 90,
 }
 _GEOM = re.compile(r"^\d+x\d+(\+-?\d+\+-?\d+)?$")
 
@@ -22,6 +22,7 @@ def load(db):
     p["sens"] = min(95, max(30, p["sens"]))
     p["monitor"] = max(0, p["monitor"])
     p["box_scale"] = min(200, max(50, p["box_scale"]))
+    p["keep_days"] = min(3650, max(0, p["keep_days"]))
     if p["theme"] not in ("dark", "light"):
         p["theme"] = "dark"
     if p["ov_mode"] not in (OV_TOP, OV_SHARE):
