@@ -24,7 +24,7 @@ SCHEMA = (
     """CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY, kind TEXT, payload TEXT, created REAL,
         tries INTEGER DEFAULT 0, next_try REAL DEFAULT 0)""",
     """CREATE TABLE IF NOT EXISTS watchlist(user_id TEXT PRIMARY KEY, username TEXT, usernames TEXT DEFAULT '[]',
-        categories TEXT DEFAULT '[]', severity TEXT, review_by REAL, updated_at REAL)""",
+        categories TEXT DEFAULT '[]', severity TEXT, review_by REAL, updated_at REAL, looks TEXT DEFAULT '[]')""",
 )
 
 
@@ -40,10 +40,12 @@ class Store:
             pass
         for sql in SCHEMA:
             self.q(sql)
-        try:                                    # databases made by older versions
-            self.q("ALTER TABLE players ADD COLUMN pinned INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
+        for alter in ("ALTER TABLE players ADD COLUMN pinned INTEGER DEFAULT 0",       # databases made by older versions
+                      "ALTER TABLE watchlist ADD COLUMN looks TEXT DEFAULT '[]'"):
+            try:
+                self.q(alter)
+            except sqlite3.OperationalError:
+                pass
 
     def q(self, sql, a=()):
         with self.lock:

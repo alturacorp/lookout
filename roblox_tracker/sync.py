@@ -10,6 +10,7 @@ the game to Roblox, not an invitation to follow or confront anyone.
 """
 import json
 import logging
+import re
 import threading
 import time
 
@@ -21,6 +22,7 @@ log = logging.getLogger("tracker")
 COOLDOWN = 10 * 60          # matches the backend: one sighting per watched player per 10 minutes
 POLL = 30                   # seconds between syncs. Each costs ~1.5 database reads: the free plan allows 50,000 a day in total
 HEARTBEAT = 5 * 60
+EVIDENCE_MAX_AGE = 15 * 60   # the backend only accepts evidence stamped with the current 10-minute slot (give or take one)
 FLAG_MAX_AGE = 14 * 86400   # the backend deletes unreviewed flags after 14 days, so don't resend older ones
 OUTBOX_MAX = 500
 MAX_PAGES = 20
@@ -31,6 +33,33 @@ def source_of(src):
     return "lexicon" if s.startswith("lex") else "ai" if s.startswith("ai") else "manual"
 
 
+def _clean_looks(looks):
+    """At most 3 fingerprints of exactly 64 small integers; anything else is ignored (the list is shared, so don't trust it)."""
+    out = []
+    for v in (looks if isinstance(looks, list) else [])[:3]:
+        if isinstance(v, list) and len(v) == 64 and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v):
+            out.append([max(0, min(127, int(x))) for x in v])
+    return out
+
+
+def _clean_names(names):
+    """In-game (display) names a reviewer added for a listed player: at most 5, 3-30 characters. The list is shared, so don't trust it."""
+    out = []
+    for n in (names if isinstance(names, list) else [])[:5]:
+        if isinstance(n, str) and 3 <= len(n.strip()) <= 30 and not re.search(r"[<>]", n):
+            out.append(n.strip())
+    return out
+
+
+def norm_name(n):
+    """Compare names ignoring case, spaces and punctuation, so 'Evie The Great' matches OCR of 'EvieTheGreat'."""
+    return re.sub(r"[^0-9a-z]", "", str(n).lower())
+
+
+MIN_ALIAS = 5               # a normalised in-game name shorter than this would match ordinary words on screen
+ALIAS_TTL = 60
+
+
 class Sync:
     def __init__(self, db, cloud, device_id, enabled=lambda: True, on_alert=None, on_status=None, clock=time.time):
         self.db, self.cloud, self.device_id = db, cloud, device_id
@@ -38,6 +67,7 @@ class Sync:
         self.state, self.message, self.last_ok = "off", "Not connected", 0
         self.wake = threading.Event()
         self._spot, self._seen_sightings, self._last_beat, self._fails, self._round = {}, [], 0, 0, 0
+        self._alias_spot, self._aliases, self._aliases_at = {}, None, 0
 
     # ------------------------------------------------------------ queueing (called by the app)
     def _enqueue(self, kind, payload):
@@ -46,14 +76,34 @@ class Sync:
         if extra > 0:
             self.db.q("DELETE FROM outbox WHERE id IN (SELECT id FROM outbox ORDER BY id LIMIT ?)", (extra,))
 
-    def queue_flag(self, username, category, source, text, user_id=None, confidence=None):
+    def queue_flag(self, username, category, source, text, user_id=None, confidence=None, escalated=False):
         p = {"username": username, "category": category, "source": source_of(source), "text": text[:300],
              "deviceId": self.device_id}
         if user_id:
             p["userId"] = str(user_id)
         if confidence is not None:
             p["confidence"] = confidence
+        if escalated:
+            p["escalated"] = True
         self._enqueue("flag", p)
+
+    def queue_evidence(self, user_id, username, match_type, confidence, jpeg, look=None):
+        """Queue a cropped picture the device owner chose to send. Only ever called after they confirmed it."""
+        import base64
+        p = {"userId": str(user_id), "username": username, "matchType": match_type, "confidence": float(confidence),
+             "image": base64.b64encode(jpeg).decode(), "deviceId": self.device_id}
+        if look:
+            p["look"] = [int(x) for x in look]
+        self._enqueue("evidence", p)
+
+    def watch_look_rows(self):
+        """[(user_id, username, [[64 ints], ...])] for live entries that have outfit references."""
+        out = []
+        for uid, name, looks in self.db.q("SELECT user_id,username,looks FROM watchlist WHERE " + self._LIVE, (self._now_ms(),)):
+            ls = _clean_looks(json.loads(looks or "[]"))
+            if ls:
+                out.append((uid, name, ls))
+        return out
 
     def spotted(self, user_id, username=""):
         """A player was just seen. If they're on the shared list: raise the local alert and queue a sighting."""
@@ -73,6 +123,37 @@ class Sync:
         r = self.db.q("SELECT user_id,username,categories,severity FROM watchlist WHERE user_id=? AND " + self._LIVE,
                       (str(user_id), self._now_ms()))
         return self._row(r[0]) if r else None
+
+    def alias_map(self):
+        """{normalised in-game name: (user_id, username)} for live entries. Cached for a minute and dropped when the list changes."""
+        if self._aliases is None or self.clock() - self._aliases_at > ALIAS_TTL:
+            m = {}
+            for uid, name, names in self.db.q("SELECT user_id,username,usernames FROM watchlist WHERE " + self._LIVE, (self._now_ms(),)):
+                for a in _clean_names(json.loads(names or "[]")):
+                    k = norm_name(a)
+                    if len(k) >= MIN_ALIAS:
+                        m[k] = (uid, name) if k not in m else None        # a name two entries share is ambiguous: ignore it
+            self._aliases, self._aliases_at = {k: v for k, v in m.items() if v}, self.clock()
+        return self._aliases
+
+    def alias_match(self, text):
+        """(user_id, username) if this on-screen text is an in-game name a reviewer added for a listed player."""
+        if not self.enabled():
+            return None
+        return self.alias_map().get(norm_name(text))
+
+    def alias_spotted(self, user_id):
+        """A listed player's in-game name was read off a name tag. Display names are shared and can change, so this is a LOCAL
+        'possible, unverified' notice only: no sighting is sent to other devices."""
+        row = self.watch_row(user_id)
+        if not row:
+            return None
+        t = self.clock()
+        if t - self._alias_spot.get(str(user_id), 0) < COOLDOWN or t - self._spot.get(str(user_id), 0) < COOLDOWN:
+            return None                                                   # recently alerted for this player, by name or by username
+        self._alias_spot[str(user_id)] = t
+        self._alert(row, "name")
+        return row
 
     def watch_rows(self):
         """Everything live on the local copy, A-Z, for the viewer window."""
@@ -100,6 +181,7 @@ class Sync:
 
     def reset_cache(self):
         self.db.q("DELETE FROM watchlist")
+        self._aliases = None
         self.db.put("sync_state", {})
         self._seen_sightings = []
 
@@ -109,13 +191,14 @@ class Sync:
         t = self.clock()
         for oid, kind, payload, created, tries, next_try in self.db.q("SELECT * FROM outbox ORDER BY id"):
             age = t - created
-            if (kind == "sighting" and age > COOLDOWN) or (kind == "flag" and age > FLAG_MAX_AGE):
+            if (kind == "sighting" and age > COOLDOWN) or (kind == "flag" and age > FLAG_MAX_AGE) \
+                    or (kind == "evidence" and age > EVIDENCE_MAX_AGE):
                 self.db.q("DELETE FROM outbox WHERE id=?", (oid,))      # too old to be useful / the rules would refuse it
                 continue
             if next_try > t:
                 continue
             try:
-                self.cloud.call("submitFlag" if kind == "flag" else "reportSighting", json.loads(payload))
+                self.cloud.call({"flag": "submitFlag", "evidence": "submitEvidence"}.get(kind, "reportSighting"), json.loads(payload))
             except CloudError as e:
                 if e.code in PERMANENT:
                     log.warning("dropping a queued %s the backend rejected (%s)", kind, e.code)
@@ -154,6 +237,7 @@ class Sync:
         self._alerts_from_others(sightings, server_time)
 
     def _apply(self, players, full=False):
+        self._aliases = None                                          # the list changed: rebuild the in-game name index
         if full:     # the backend sent the whole list: anyone not on it any more is dropped
             keep = {str(p["userId"]) for p in players if p.get("status") == "watch"}
             for uid in self.watch_ids() - keep:
@@ -164,9 +248,10 @@ class Sync:
             if old and old[0][0] is not None and p.get("updatedAt", 0) < old[0][0]:
                 continue                                              # an older copy of something we already have
             if p.get("status") == "watch":
-                self.db.q("INSERT OR REPLACE INTO watchlist VALUES(?,?,?,?,?,?,?)", (
-                    uid, p.get("username", ""), json.dumps(p.get("usernames", [])), json.dumps(p.get("categories", [])),
-                    p.get("severity", "normal"), p.get("reviewBy"), p.get("updatedAt", 0)))
+                self.db.q("INSERT OR REPLACE INTO watchlist(user_id,username,usernames,categories,severity,review_by,updated_at,looks) "
+                          "VALUES(?,?,?,?,?,?,?,?)", (
+                    uid, p.get("username", ""), json.dumps(_clean_names(p.get("seenAs"))), json.dumps(p.get("categories", [])),
+                    p.get("severity", "normal"), p.get("reviewBy"), p.get("updatedAt", 0), json.dumps(_clean_looks(p.get("looks")))))
             else:
                 self.db.q("DELETE FROM watchlist WHERE user_id=?", (uid,))
 

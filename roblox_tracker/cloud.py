@@ -267,7 +267,7 @@ class Cloud:
             raise CloudError("permission-denied", "This account hasn't been approved yet.")
         try:
             return {"submitFlag": self._submit_flag, "reportSighting": self._report_sighting,
-                    "syncWatchlist": self._sync}[name](data)
+                    "submitEvidence": self._submit_evidence, "syncWatchlist": self._sync}[name](data)
         except CloudError as e:
             if e.code == "permission-denied" and name != "syncWatchlist":
                 # Either the account lost access, or the rules refused this one item (e.g. the player is no longer on
@@ -286,6 +286,8 @@ class Cloud:
              "expireAt": Ts(self.clock() * 1000 + 14 * DAY_MS)}
         if d.get("confidence") is not None:
             f["confidence"] = float(d["confidence"])
+        if d.get("escalated"):
+            f["escalated"] = True
         try:
             self._create(f"flags/{fid}", f, server_time=("createdAt", "updatedAt"))
         except CloudError as e:
@@ -306,6 +308,28 @@ class Cloud:
                 return {"recorded": False, "reason": "cooldown"}
             raise
         return {"recorded": True, "reason": "ok"}
+
+    def _submit_evidence(self, d):
+        """A cropped picture the device owner chose to send. The id limits how often one player is reported per device."""
+        import base64
+        img = base64.b64decode(d["image"])
+        if not img or len(img) > 90000:
+            raise CloudError("invalid-argument", "The picture is too large to send.")
+        now_ms = self.clock() * 1000
+        dev = "".join(ch for ch in str(d["deviceId"]) if ch.isalnum())[:8] or "dev"
+        eid = f"{d['userId']}_{int(now_ms // 600000)}_{dev}"
+        f = {"userId": str(d["userId"]), "username": d["username"], "matchType": d["matchType"],
+             "confidence": float(d["confidence"]), "image": Bytes(img), "deviceId": d["deviceId"], "reporter": self.uid,
+             "expireAt": Ts(now_ms + 30 * DAY_MS)}
+        if d.get("look"):
+            f["look"] = [int(x) for x in d["look"]]
+        try:
+            self._create(f"evidence/{eid}", f)
+        except CloudError as e:
+            if e.code == "already-exists":
+                return {"recorded": False, "reason": "already-sent"}
+            raise
+        return {"recorded": True}
 
     def _query(self, collection, where=None, order=None, limit=None):
         q = {"from": [{"collectionId": collection}]}
@@ -338,7 +362,7 @@ class Cloud:
             out["fullList"] = True
             out["players"] = [{"userId": p["userId"], "username": p.get("username", ""), "status": "watch",
                                "categories": p.get("categories", []), "severity": p.get("severity", "normal"),
-                               "reviewBy": p.get("reviewBy"), "updatedAt": p.get("updatedAt", 0)}
+                               "reviewBy": p.get("reviewBy"), "updatedAt": p.get("updatedAt", 0), "looks": p.get("looks", []), "seenAs": p.get("seenAs", [])}
                               for p in players if (p.get("reviewBy") or 0) > now_ms]        # lapsed entries don't count
         s_since = d.get("sightingsSince")
         if s_since is not None and d.get("wantSightings", True):
@@ -352,6 +376,10 @@ class Cloud:
 
 
 # ---- Firestore value encoding (just the types this app uses)
+class Bytes(bytes):
+    """Raw bytes (a small picture), encoded as a Firestore bytes value."""
+
+
 class Ts(int):
     """A timestamp in milliseconds, so it is encoded as a Firestore timestamp rather than a plain number."""
 
@@ -371,6 +399,9 @@ def parse_iso(s):
 def enc(v):
     if isinstance(v, Ts):
         return {"timestampValue": iso(int(v))}
+    if isinstance(v, Bytes):
+        import base64
+        return {"bytesValue": base64.b64encode(bytes(v)).decode()}
     if isinstance(v, bool):
         return {"booleanValue": v}
     if isinstance(v, int):

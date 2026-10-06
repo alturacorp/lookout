@@ -372,6 +372,8 @@ def cloud_dialog(app):
     f.pack()
     on = tk.BooleanVar(d, app.prefs["cloud_on"])
     submit = tk.BooleanVar(d, app.prefs["cloud_submit"])
+    esc = tk.BooleanVar(d, app.prefs["escalate_on"])
+    esc_min = tk.IntVar(d, app.prefs["escalate_min"])
     email, pw, state = tk.StringVar(d, app.cloud.email), tk.StringVar(d), tk.StringVar(d)
 
     ttk.Label(f, text="Get the shared watchlist and alerts from the safety team's reviewers.", wraplength=430,
@@ -386,7 +388,7 @@ def cloud_dialog(app):
     acct = ttk.Frame(f)
     acct.grid(row=3, column=0, columnspan=2, sticky="w")
     status = ttk.Label(f, textvariable=state, wraplength=430, justify="left")
-    status.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+    status.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
     def describe():
         for w in acct.winfo_children():
@@ -441,22 +443,32 @@ def cloud_dialog(app):
         row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
     ttk.Checkbutton(f, text="Send flags to the reviewers when I press Confirm", variable=submit).grid(
         row=5, column=0, columnspan=2, sticky="w")
+    er = ttk.Frame(f)
+    er.grid(row=6, column=1, sticky="e")
+    ttk.Checkbutton(f, text="Send serious AI detections to the reviewers' Urgent tab (they decide; nobody is listed)",
+                    variable=esc).grid(row=6, column=0, sticky="w", pady=(0, 0))
+    ttk.Label(er, text="min %").pack(side="left")
+    ttk.Spinbox(er, from_=70, to=99, width=3, textvariable=esc_min).pack(side="left", padx=(2, 0))
     ttk.Label(f, text="What's sent: the username, the chat line and category you confirmed, and a random device id. "
-                      "Never sent: screenshots, outfit data, or your other chat.", wraplength=430, justify="left",
-              foreground="#555").grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+                      "Never sent: screenshots, outfit data, or your other chat. With the Urgent option on, a serious AI detection is also sent without you pressing Confirm; reviewers see it as unconfirmed.", wraplength=430, justify="left",
+              foreground="#555").grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
     def save():
-        app.prefs.update(cloud_on=bool(on.get()), cloud_submit=bool(submit.get()))
+        try:
+            lo = min(99, max(70, int(esc_min.get())))
+        except (tk.TclError, ValueError):
+            lo = app.prefs["escalate_min"]
+        app.prefs.update(cloud_on=bool(on.get()), cloud_submit=bool(submit.get()), escalate_on=bool(esc.get()), escalate_min=lo)
         app.save_prefs()
         app.sync.wake.set()
         d.destroy()
     row = ttk.Frame(f)
-    row.grid(row=8, column=0, columnspan=2, pady=(12, 0))
+    row.grid(row=9, column=0, columnspan=2, pady=(12, 0))
     ttk.Button(row, text="Save", command=save).pack(side="left", padx=4)
     ttk.Button(row, text="Sync now", command=lambda: (app.sync.wake.set(), d.after(2500, describe))).pack(side="left", padx=4)
     ttk.Button(row, text="Close", command=d.destroy).pack(side="left", padx=4)
     row2 = ttk.Frame(f)
-    row2.grid(row=9, column=0, columnspan=2, pady=(8, 0))
+    row2.grid(row=10, column=0, columnspan=2, pady=(8, 0))
     ttk.Button(row2, text="View the shared list…", command=lambda: watchlist_dialog(app)).pack(side="left", padx=4)
     url = app.cloud.dashboard_url()
     if url:
@@ -643,3 +655,109 @@ def setup_dialog(app):
     row.pack(pady=(6, 0))
     ttk.Button(row, text="Re-check", command=paint).pack(side="left", padx=4)
     ttk.Button(row, text="Close", command=d.destroy).pack(side="left", padx=4)
+
+
+def welcome_dialog(app):
+    """First launch: four steps with live ticks instead of a pile of separate windows."""
+    w = tk.Toplevel(app.root)
+    w.title("Welcome to Lookout")
+    w.attributes("-topmost", True)
+    f = ttk.Frame(w, padding=14)
+    f.pack(fill="both")
+    ttk.Label(f, text="Let's get you set up", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+    ttk.Label(f, wraplength=480, justify="left", text="Four quick steps. Nothing is sent anywhere until you sign in to the "
+              "shared list, and even then only the flags you confirm are shared (never screenshots).").pack(anchor="w", pady=(2, 10))
+    steps = ttk.Frame(f)
+    steps.pack(fill="x")
+    marks = {}
+
+    def step(i, title, detail, label, command):
+        mark = tk.Label(steps, text="○", font=("Segoe UI", 14), fg="#757575")
+        mark.grid(row=i, column=0, sticky="n", padx=(0, 10), pady=6)
+        box = ttk.Frame(steps)
+        box.grid(row=i, column=1, sticky="w", pady=6)
+        ttk.Label(box, text=title, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        info = ttk.Label(box, text=detail, wraplength=300, justify="left")
+        info.pack(anchor="w")
+        ttk.Button(steps, text=label, command=command).grid(row=i, column=2, padx=10, sticky="e")
+        marks[i] = (mark, info)
+
+    step(0, "1. Check this computer", "", "Check…", lambda: setup_dialog(app))
+    step(1, "2. Where to read", "", "Choose areas…", lambda: regions_dialog(app))
+    step(2, "3. Try a scan", "Open the game, then press this. Names it finds appear in the list.", "Scan now", app.trigger.set)
+    step(3, "4. Shared safety list (optional)", "", "Sign in…", lambda: cloud_dialog(app))
+
+    def tick(i, done, text=None):
+        mark, info = marks[i]
+        mark.config(text="✓" if done else "○", fg="#2e7d32" if done else "#757575")
+        if text is not None:
+            info.config(text=text)
+
+    def refresh():
+        if not w.winfo_exists():
+            return
+        miss = health.missing_required()
+        tick(0, not miss, "Everything required is installed." if not miss else "Missing: " + ", ".join(miss))
+        n = len(app.regions)
+        tick(1, n > 0, f"{n} area(s) chosen." if n else "Optional: limit reading to the chat and name areas to cut mistakes.")
+        total = app.db.scalar("SELECT COUNT(*) FROM players")
+        tick(2, total > 0, f"{total} player(s) logged so far." if total else None)
+        c = app.cloud
+        if not c.ready:
+            tick(3, False, "This build isn't connected to a backend; skip this step.")
+        elif c.signed_in:
+            tick(3, True, f"Signed in as {c.email}" + (f" ({c.role})" if c.role else "") + ".")
+        else:
+            tick(3, False, "Sign in to get the reviewers' watchlist and alerts.")
+        w.after(2000, refresh)
+
+    def finish():
+        app.prefs["setup_done"] = True
+        app.save_prefs()
+        w.destroy()
+    ttk.Button(f, text="Done", command=finish).pack(pady=(12, 0))
+    w.protocol("WM_DELETE_WINDOW", finish)
+    refresh()
+
+
+def evidence_dialog(app, ctx):
+    """Show exactly what would be sent and ask. Nothing leaves this computer unless 'Send' is pressed."""
+    import io
+    import time as _t
+    from PIL import Image, ImageTk
+    d = tk.Toplevel(app.root)
+    d.title("Send a picture to the reviewers?")
+    d.attributes("-topmost", True)
+    f = ttk.Frame(d, padding=12)
+    f.pack()
+    left = max(0, int(config.EVIDENCE_WINDOW - (_t.time() - ctx["t"])))
+    kind = "name tag" if ctx["kind"] == "nametag" else f"outfit similarity {ctx['conf']:.0%} (unverified)"
+    ttk.Label(f, text=f"{ctx['username']}: matched by {kind}", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+    try:
+        img = ImageTk.PhotoImage(Image.open(io.BytesIO(ctx["jpeg"])))
+        lab = ttk.Label(f, image=img)
+        lab.image = img
+        lab.pack(pady=8)
+    except Exception:
+        ttk.Label(f, text="(preview unavailable)").pack(pady=8)
+    ttk.Label(f, wraplength=380, justify="left", text="This is the whole picture that will be sent: cropped to this one player, so the rest of "
+              "your screen, other players' names and chat are not included. Only the safety reviewers can see it. It is kept for 30 days "
+              "and deleted if the player is cleared. The reviewers decide what happens; nobody is added to a list because of it.").pack(anchor="w")
+    if ctx["kind"] == "outfit":
+        ttk.Label(f, wraplength=380, justify="left", foreground="#a33",
+                  text="An outfit match can easily be a different player in similar clothes. Only send it if you can see it is the right person.").pack(anchor="w", pady=(6, 0))
+    note = ttk.Label(f, text="" if left else "Too long ago to send: take a new one the next time you see them.", foreground="#a33")
+    note.pack(anchor="w", pady=(6, 0))
+
+    def send():
+        if app.send_evidence(ctx):
+            d.destroy()
+        else:
+            note.config(text="Sign in to the shared list (and allow sending) first.")
+    row = ttk.Frame(f)
+    row.pack(pady=(10, 0))
+    b = ttk.Button(row, text="Send this picture", command=send)
+    b.pack(side="left", padx=4)
+    if not left:
+        b.state(["disabled"])
+    ttk.Button(row, text="Don't send", command=d.destroy).pack(side="left", padx=4)

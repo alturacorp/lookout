@@ -18,6 +18,11 @@ MIN_CONF, GRACE, IDLE_SECS, MOVE_PX, CROP_EVERY = 0.65, 3, 60, 40, 300
 # look recognition (tune MATCH/MARGIN if you get wrong / missed auto-IDs)
 USE_YOLO = True                 # optional person detector (pip install ultralytics); falls back silently
 GALLERY_MAX, MATCH, MARGIN = 16, 0.92, 0.03
+# Matching ONE outfit against the shared watchlist is a much weaker signal than matching your own taught players, because the
+# fingerprint is only a colour summary. So it is stricter, and its results are always shown as "possible, unverified".
+CENTRAL_MATCH, CENTRAL_MARGIN = 0.96, 0.02
+EVIDENCE_MAX_BYTES = 60000   # the picture sent is small: cropped to one player, at most this many bytes
+EVIDENCE_WINDOW = 10 * 60    # how long after an alert the owner can still choose to send a picture
 
 # on-device text classifier
 N_FEAT = 1 << 14
@@ -106,3 +111,7 @@ os.makedirs(IMG, exist_ok=True)
 
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# Keep in step with highSeverity() in firebase/firestore.rules and HIGH_SEVERITY in the dashboard's config.js.
+HIGH_SEVERITY = ("predatory_behaviour", "threats", "doxxing", "self_harm_encouragement", "extremism", "sexual_content")

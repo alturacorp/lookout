@@ -5,7 +5,7 @@ import numpy as np
 from PIL import Image
 
 from . import config
-from .config import GALLERY_MAX, IMG, MARGIN, MATCH, now
+from .config import CENTRAL_MARGIN, CENTRAL_MATCH, EVIDENCE_MAX_BYTES, GALLERY_MAX, IMG, MARGIN, MATCH, now
 
 BASIC = {"black": (20, 20, 20), "white": (235, 235, 235), "grey": (128, 128, 128),
          "red": (200, 40, 40), "orange": (230, 130, 30), "yellow": (235, 220, 50),
@@ -144,3 +144,54 @@ class Gallery:
         if self.db.scalar("SELECT COUNT(*) FROM looks WHERE player=?", (name,)) > GALLERY_MAX:
             self.db.q("DELETE FROM looks WHERE id=(SELECT id FROM looks WHERE player=? AND src='auto' ORDER BY id LIMIT 1)", (name,))
         self.reload()
+
+
+# ---- the shared list's outfit references, and the pictures sent as evidence
+def quantize(vec):
+    """A fingerprint as 64 small integers (0-127), the form stored in the shared list."""
+    return [int(max(0, min(127, round(float(x) * 127)))) for x in vec]
+
+
+def dequantize(ints):
+    v = np.asarray(ints, np.float32) / 127.0
+    return (v / (np.linalg.norm(v) + 1e-9)).astype(np.float32)
+
+
+class Central:
+    """Outfit references from the shared watchlist. A match is only ever 'possible, unverified': it never flags or lists anyone."""
+
+    def __init__(self):
+        self.refs = {}                              # user id -> (username, matrix of fingerprints)
+
+    def load(self, rows):
+        self.refs = {uid: (name, np.stack([dequantize(v) for v in looks])) for uid, name, looks in rows if looks}
+
+    def match(self, vec):
+        """-> (user id or None, best similarity). Needs to clearly beat the runner-up, and clear a stricter bar than your own taught looks."""
+        s = sorted(((float((m @ vec).max()), uid) for uid, (_, m) in self.refs.items()), reverse=True)
+        if not s:
+            return None, 0.0
+        ok = s[0][0] >= CENTRAL_MATCH and s[0][0] - (s[1][0] if len(s) > 1 else 0) >= CENTRAL_MARGIN
+        return (s[0][1] if ok else None), s[0][0]
+
+    def name(self, uid):
+        return self.refs.get(uid, ("", None))[0]
+
+
+def evidence_jpeg(im, max_side=320, limit=EVIDENCE_MAX_BYTES):
+    """Shrink a crop of ONE player until it fits the size limit. Returns JPEG bytes."""
+    import io
+    im = im.convert("RGB")
+    w, h = im.size
+    k = min(1.0, max_side / max(w, h, 1))
+    if k < 1:
+        im = im.resize((max(1, int(w * k)), max(1, int(h * k))))
+    for q in (75, 65, 55, 45, 35):
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=q, optimize=True)
+        if buf.tell() <= limit:
+            return buf.getvalue()
+    im = im.resize((max(1, im.width // 2), max(1, im.height // 2)))
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=40, optimize=True)
+    return buf.getvalue()

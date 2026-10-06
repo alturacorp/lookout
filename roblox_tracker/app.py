@@ -24,14 +24,14 @@ from . import build_info, config, dialogs, icons, paths, teach, theme, tray, upd
 from . import cloud as cloud_mod
 from . import prefs as prefs_mod
 from .ai import Clf, verdict
-from .config import (BUILTIN, CHAT_RE, CORNERS, CROP_EVERY, DEFAULT_AI_OFF, GRACE, IDLE_SECS, IMG, MIN_CONF,
+from .config import (BUILTIN, HIGH_SEVERITY, CHAT_RE, CORNERS, CROP_EVERY, DEFAULT_AI_OFF, GRACE, IDLE_SECS, IMG, MIN_CONF,
                      MOVE_PX, NAME_RE, OV_SHARE, OV_TOP, SEEDS, now)
 from .overlay import Overlay, ShareView
 from .scene import Candidates, Ease, ListZones, find_lists, frame_sig, inside_any, plausible, same_frame
 from .store import Store
 from .sync import Sync
 from .textutil import download, file_owner, http, remove_file, skel
-from .vision import Detector, Gallery, candidates, colours, crop, embed, near, person_box
+from .vision import Central, Detector, Gallery, candidates, colours, crop, embed, evidence_jpeg, near, person_box, quantize
 
 log = logging.getLogger("tracker")
 
@@ -43,6 +43,9 @@ class App:
         self.prefs = prefs_mod.load(self.db)
         config.OLLAMA, config.MODEL = self.prefs["ollama"], self.prefs["model"]
         self.gallery = Gallery(self.db)
+        self.alias_run, self.alias_boxes = {}, {}
+        self.alias_run, self.alias_boxes = {}, {}                 # in-game name matches: consecutive scans, and where they were
+        self.central, self._central_at, self._outfit_seen, self._frame_ref = Central(), 0, {}, None
         self.detector = Detector()
         self.clf = Clf()
         self.lexicon = self.load_lexicon()
@@ -362,7 +365,7 @@ class App:
     def first_run(self):
         self.prefs["setup_done"] = True
         self.save_prefs()
-        dialogs.setup_dialog(self)
+        dialogs.welcome_dialog(self)
 
     def apply_tray_pref(self):
         want = self.prefs["tray"] and tray.available()
@@ -597,32 +600,63 @@ class App:
         if self.prefs["cloud_on"] and uid and self.track.get(n, {}).get("present"):
             self.sync.spotted(uid, n)
 
-    def show_alert(self, row, where):
-        """Small always-on-top notice. Closes itself; click to dismiss."""
+    def show_alert(self, row, where, ctx=None):
+        """Small always-on-top notice. where: 'here' (their name tag matched), 'outfit' (outfit resembles a reference, unverified)
+        or 'another device'. It says plainly that this is a match against the central database, and offers to send a cropped
+        picture to the reviewers (only if you choose to). Closes itself; click to dismiss."""
         cats = ", ".join(c.replace("_", " ") for c in row["categories"]) or "watchlist"
-        here = where == "here"
+        here, name_only = where == "here", where == "name"
+        outfit = where in ("outfit", "name")                      # both are 'possible, unverified' matches (amber)
         if here:
             self.db.event(row["username"], "watchlist", cats)
-        self.status.config(text=f"Watchlist: {row['username']} ({cats})")
+            ctx = ctx or self.nametag_evidence(row)
+        elif name_only:
+            self.db.event(row["username"], "possible name match (unverified)", cats)
+            ctx = None                                           # not exact enough to offer a picture as a name-tag match
+        self.status.config(text=f"Central database match: {row['username']} ({cats})" + (" - possible, unverified" if outfit else ""))
         t = tk.Toplevel(self.root)
         t.overrideredirect(True)
         t.attributes("-topmost", True)
-        f = tk.Frame(t, bg="#7a1f1f", padx=14, pady=10)
+        bg = "#5b3a00" if outfit else "#7a1f1f"
+        f = tk.Frame(t, bg=bg, padx=14, pady=10)
         f.pack()
-        title = f"{row['username']} is on the safety watchlist" + ("" if here else " (seen by another device)")
-        tk.Label(f, text=title, bg="#7a1f1f", fg="white", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        tk.Label(f, text=cats.capitalize(), bg="#7a1f1f", fg="#ffd9d9", font=("Segoe UI", 10)).pack(anchor="w")
+        if name_only:
+            title = f"Possible match with the central database: {row['username']}"
+            how = "A name tag reads as an in-game name on the safety list. Display names aren't unique and can be changed, so this is UNVERIFIED: don't act on it alone."
+        elif outfit:
+            title = f"Possible match with the central database: {row['username']}"
+            how = f"Outfit colours resemble a listed player ({ctx['conf']:.0%}). This is UNVERIFIED: don't act on it alone." if ctx else \
+                  "Outfit colours resemble a listed player. This is UNVERIFIED: don't act on it alone."
+        elif here:
+            title = f"{row['username']} matches the central safety database"
+            how = "Matched by name tag."
+        else:
+            title = f"{row['username']} is on the safety watchlist (seen by another device)"
+            how = None
+        tk.Label(f, text=title, bg=bg, fg="white", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        tk.Label(f, text=cats.capitalize(), bg=bg, fg="#ffd9d9", font=("Segoe UI", 10)).pack(anchor="w")
+        if how:
+            tk.Label(f, text=how, bg=bg, fg="white", font=("Segoe UI", 9), wraplength=330, justify="left").pack(anchor="w", pady=(4, 0))
         tk.Label(f, text="Report them in-game with Roblox's report tools.\nPlease don't follow or confront them.",
-                 bg="#7a1f1f", fg="white", font=("Segoe UI", 9), justify="left").pack(anchor="w", pady=(6, 0))
+                 bg=bg, fg="white", font=("Segoe UI", 9), justify="left").pack(anchor="w", pady=(6, 0))
+        can_send = bool(ctx) and self.prefs["cloud_on"] and self.prefs["cloud_submit"] and self.cloud.signed_in
+        if can_send:
+            b = tk.Button(f, text="Attach a cropped picture for the reviewers…", command=lambda: (t.destroy(), dialogs.evidence_dialog(self, ctx)))
+            b.pack(anchor="w", pady=(8, 0))
         t.update_idletasks()
         self.toasts = [x for x in self.toasts if x.winfo_exists()]
         x = t.winfo_screenwidth() - t.winfo_reqwidth() - 20
         y = t.winfo_screenheight() - (t.winfo_reqheight() + 12) * (len(self.toasts) + 1) - 60
         t.geometry(f"+{x}+{y}")
         self.toasts.append(t)
-        for w in (t, f, *f.winfo_children()):
+        for w in (t, f, *[c for c in f.winfo_children() if not isinstance(c, tk.Button)]):
             w.bind("<Button-1>", lambda e, t=t: t.destroy())
-        t.after(15000, lambda: t.winfo_exists() and t.destroy())
+        t.after(30000 if can_send else 15000, lambda: t.winfo_exists() and t.destroy())
+
+    def nametag_evidence(self, row):
+        """Prepare a cropped picture for a name-tag match (kept in memory; nothing is sent unless the owner agrees)."""
+        im = self.evidence_for_nametag(row["username"])
+        return self.make_evidence(row, "nametag", 1.0, im) if im is not None else None
         self.root.bell()
 
     def summarise(self):
@@ -743,7 +777,8 @@ class App:
         known, rects, ov = self.known_names(), self.rects(frame), list(self.ov_rects)
         self.names |= known
         self.frame_shape = frame.shape
-        boxes, words = [], []
+        self._frame_ref = frame                                  # the latest frame, only so an alert can crop evidence from it
+        boxes, words, alias_c = [], [], []
         for b, text, conf in res:
             conf = float(conf)
             if conf < MIN_CONF:
@@ -755,6 +790,9 @@ class App:
                 boxes.append(((y1 + y2) / 2, x1, y2 - y1, text.strip()))
             else:
                 t = text.strip().lstrip("@")
+                hit = self.sync.alias_match(t)
+                if hit:
+                    alias_c.append((hit, (x1, y1, x2, y2)))          # an in-game name a reviewer added for a listed player
                 if NAME_RE.match(t) and t.lower() not in ignored:
                     words.append((t, conf, (x1, y1, x2, y2)))
         # The player list / leaderboard is a column of names too. Never read names from it.
@@ -777,8 +815,21 @@ class App:
                 self.consider(n)
         self.cands.prune(self.scan_n)
         self.tag_seen, self.tag_boxes = set(tags), dict(tags)
+        self.alias_step([(h, bx) for h, bx in alias_c if not inside_any(bx, skip)])
         self.activity(frame, tags)
         self.root.after(0, self.after_scan, len(tags), bool(rects))
+
+    def alias_step(self, hits):
+        """A name tag reads as an in-game name a reviewer added. Needs two scans in a row (OCR noise), then a LOCAL 'possible' alert."""
+        now_hits = {}
+        for (uid, username), bx in hits:
+            now_hits[uid] = bx
+            self.alias_boxes[username] = bx
+        for uid in now_hits:
+            self.alias_run[uid] = self.alias_run.get(uid, 0) + 1
+            if self.alias_run[uid] == 2:
+                self.sync.alias_spotted(uid)
+        self.alias_run = {u: n for u, n in self.alias_run.items() if u in now_hits}
 
     def after_scan(self, n, has_region):
         hint = "" if has_region else "  |  no chat region (F1, right-drag over chat)"
@@ -912,9 +963,11 @@ class App:
                 bodies[n] = (box, approx)
             try:
                 im = crop(frame, box)
-                who, sim = self.gallery.match(embed(im))
+                vec = embed(im)
+                who, sim = self.gallery.match(vec)
             except Exception:
                 continue
+            self.check_central_outfit(vec, n, box, frame, im)
             if n and who == n and sim < 0.985 and time.time() - self.last_auto.get(n, 0) > 120:
                 self.last_auto[n] = time.time()          # nametag and look agree -> safe to keep learning
                 self.gallery.add(n, im, "auto")
@@ -925,6 +978,68 @@ class App:
                     self.db.event(who, "recognised by look", f"{sim:.0%}")
         self.bodies = bodies
         return tags
+
+    def refresh_central(self):
+        """Reload the shared list's outfit references now and then (cheap: a local table read)."""
+        if time.time() - self._central_at > 30:
+            self._central_at = time.time()
+            try:
+                self.central.load(self.sync.watch_look_rows() if self.prefs["cloud_on"] else [])
+            except Exception:
+                log.exception("loading outfit references failed")
+
+    def check_central_outfit(self, vec, nametag, box, frame, im):
+        """A person's outfit resembles a reference on the shared list. This is only ever 'possible, unverified': a local warning,
+        no sighting sent, nobody flagged. A person whose name tag already matched is handled by the name-tag path."""
+        if not self.prefs["cloud_on"]:
+            return
+        self.refresh_central()
+        uid, sim = self.central.match(vec)
+        if not uid:
+            return
+        row = self.sync.watch_row(uid)
+        if not row or (nametag and nametag.lower() == row["username"].lower()):
+            return
+        t = time.time()
+        if t - self._outfit_seen.get(uid, 0) < 600:
+            return
+        self._outfit_seen[uid] = t
+        self.db.event(row["username"], "possible outfit match (unverified)", f"{sim:.0%}")
+        ctx = self.make_evidence(row, "outfit", sim, im)
+        self.root.after(0, self.show_alert, row, "outfit", ctx)
+
+    def make_evidence(self, row, kind, conf, im):
+        """Prepare (in memory only) the picture that COULD be sent. Nothing leaves the computer unless the owner agrees."""
+        try:
+            return {"uid": row["user_id"], "username": row["username"], "kind": kind, "conf": float(conf), "t": time.time(),
+                    "jpeg": evidence_jpeg(im), "look": quantize(embed(im)) if kind == "nametag" else None}
+        except Exception:
+            log.exception("preparing evidence failed")
+            return None
+
+    def evidence_for_nametag(self, username):
+        """Crop the player whose name tag just matched, from the latest frame."""
+        frame = self._frame_ref
+        if frame is None:
+            return None
+        key = next((n for n in list(self.bodies) if n.lower() == username.lower()), None)
+        box = self.bodies[key][0] if key else None
+        if box is None:
+            tag = next((b for n, b in list(self.tag_boxes.items()) + list(self.alias_boxes.items()) if n.lower() == username.lower()), None)
+            if tag is None:
+                return None
+            box = person_box(tag, self.frame_shape, self.prefs["box_scale"] / 100)
+        return crop(frame, box)
+
+    def send_evidence(self, ctx):
+        """The owner saw the picture and agreed. Queue it for the reviewers."""
+        if not (self.prefs["cloud_on"] and self.prefs["cloud_submit"] and self.cloud.signed_in):
+            return False
+        self.sync.queue_evidence(ctx["uid"], ctx["username"], ctx["kind"], ctx["conf"], ctx["jpeg"], ctx.get("look"))
+        self.sync.wake.set()
+        self.db.event(ctx["username"], "evidence sent", f"{ctx['kind']} {ctx['conf']:.0%}")
+        self.status.config(text=f"Sent a cropped picture of {ctx['username']} to the reviewers")
+        return True
 
     def update_tracks(self, frame, tags):
         t = time.time()
@@ -1099,7 +1214,49 @@ class App:
         cat, conf = res
         self.db.q("INSERT INTO flags(chat_id,player,cat,src,t) VALUES(?,?,?,?,?)", (cid, who, cat, f"ai {conf:.0%}", now()))
         self.db.event(who, "flagged", f"{cat}: {msg}")
+        self.escalate(who, cat, conf, msg)
         self.root.after(0, self.refresh)
+
+    def escalate(self, who, cat, conf, msg):
+        """A serious category at very high confidence goes straight to the reviewers' Urgent tab for a human to look at.
+        This is NOT a confirmation and puts nobody on any list; it only asks for a human look sooner. Off by default."""
+        p = self.prefs
+        if not (p["escalate_on"] and p["cloud_on"] and p["cloud_submit"] and self.cloud.signed_in):
+            return False
+        if cat not in HIGH_SEVERITY or conf < p["escalate_min"] / 100:
+            return False
+        r = self.db.q("SELECT uid,verified FROM players WHERE name=?", (who,))
+        if not r or r[0][1] != 1 or not r[0][0]:
+            self.db.event(who, "escalation skipped", "no verified Roblox account for this name")
+            return False
+        self.sync.queue_flag(who, cat, "ai", msg, r[0][0], confidence=conf, escalated=True)
+        self.sync.wake.set()
+        self.db.event(who, "escalated", f"{cat} {conf:.0%}: sent to the reviewers' urgent list")
+        self.root.after(0, self.show_escalation, who, cat)
+        return True
+
+    def show_escalation(self, who, cat):
+        """Small notice that something was sent for urgent human review. Click to dismiss."""
+        cat = cat.replace("_", " ")
+        self.status.config(text=f"Sent {who} to the reviewers' urgent list ({cat})")
+        t = tk.Toplevel(self.root)
+        t.overrideredirect(True)
+        t.attributes("-topmost", True)
+        f = tk.Frame(t, bg="#5b3a00", padx=14, pady=10)
+        f.pack()
+        tk.Label(f, text="Sent for urgent review", bg="#5b3a00", fg="white", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        tk.Label(f, text=f"{who}: {cat}", bg="#5b3a00", fg="#ffe3b0", font=("Segoe UI", 10)).pack(anchor="w")
+        tk.Label(f, text="A reviewer will decide. Nobody has been added to any list.\nIf you are in danger or someone is at risk, use the game's report tools now.",
+                 bg="#5b3a00", fg="white", font=("Segoe UI", 9), justify="left").pack(anchor="w", pady=(6, 0))
+        t.update_idletasks()
+        self.toasts = [x for x in self.toasts if x.winfo_exists()]
+        x = t.winfo_screenwidth() - t.winfo_reqwidth() - 20
+        y = t.winfo_screenheight() - (t.winfo_reqheight() + 12) * (len(self.toasts) + 1) - 60
+        t.geometry(f"+{x}+{y}")
+        self.toasts.append(t)
+        for w in (t, f, *f.winfo_children()):
+            w.bind("<Button-1>", lambda e, t=t: t.destroy())
+        t.after(20000, lambda: t.winfo_exists() and t.destroy())
 
     # ================================================================ live overlay
     def close_overlays(self):
