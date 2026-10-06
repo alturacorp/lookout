@@ -1014,7 +1014,8 @@ class App:
     def add_look_matches(self, frame, tags):
         """Keep refining known looks when nametag and look agree; surface players recognised by look alone."""
         tags, bodies = dict(tags), {}
-        for box, n, approx in candidates(frame, tags, self.detector(frame), self.prefs["box_scale"] / 100):
+        cands = candidates(frame, tags, self.detector(frame), self.prefs["box_scale"] / 100)
+        for box, n, approx in cands:
             if n:
                 bodies[n] = (box, approx)
             try:
@@ -1033,7 +1034,23 @@ class App:
                 if who not in self.live:
                     self.db.event(who, "recognised by look", f"{sim:.0%}")
         self.bodies = bodies
+        self.scan_untagged(frame, candidates_found=bool(bodies) or any(not n for _, n, _ in cands))
         return tags
+
+    def scan_untagged(self, frame, candidates_found):
+        """Look for listed outfits whether or not a name tag is readable. With a person detector the detected people are
+        already checked above; without one, slide windows over the frame (throttled)."""
+        if not self.prefs["cloud_on"] or time.time() - getattr(self, "_win_at", 0) < 6:
+            return
+        self.refresh_central()
+        if not self.central.refs or (candidates_found and self.detector(frame)):
+            return
+        self._win_at = time.time()
+        try:
+            for box, vec in self.central.scan(frame, skip=[b for b, _ in self.bodies.values()]):
+                self.check_central_outfit(vec, None, box, frame, crop(frame, box))
+        except Exception:
+            log.exception("outfit scan failed")
 
     def refresh_central(self):
         """Reload the shared list's outfit references now and then (cheap: a local table read)."""

@@ -177,6 +177,32 @@ class Central:
     def name(self, uid):
         return self.refs.get(uid, ("", None))[0]
 
+    def scan(self, frame, skip=(), max_w=480):
+        """No person detector installed: slide avatar-shaped windows over the frame and keep the best outfit match.
+        -> [(box, fingerprint)] of at most one window per matched player, in full-frame coordinates."""
+        if not self.refs:
+            return []
+        H, W = frame.shape[:2]
+        k = min(1.0, max_w / W)
+        small = frame if k == 1 else np.ascontiguousarray(np.asarray(Image.fromarray(frame[..., ::-1]).resize((int(W * k), int(H * k))))[..., ::-1])
+        h0, w0 = small.shape[:2]
+        best = {}
+        for fh in (0.16, 0.22, 0.3, 0.4):
+            wh = int(h0 * fh)
+            ww = max(16, int(wh * 0.45))
+            if wh < 24 or wh > h0:
+                continue
+            for y in range(0, h0 - wh + 1, max(3, wh // 6)):
+                for x in range(0, w0 - ww + 1, max(3, ww // 3)):
+                    box = (int(x / k), int(y / k), int((x + ww) / k), int((y + wh) / k))
+                    if any(box[0] < s[2] and s[0] < box[2] and box[1] < s[3] and s[1] < box[3] for s in skip):
+                        continue
+                    vec = embed(crop(small, (x, y, x + ww, y + wh)))
+                    uid, sim = self.match(vec)
+                    if uid and sim > best.get(uid, (0,))[0]:
+                        best[uid] = (sim, box, vec)
+        return [(b, v) for _, b, v in best.values()]
+
 
 def evidence_jpeg(im, max_side=320, limit=EVIDENCE_MAX_BYTES):
     """Shrink a crop of ONE player until it fits the size limit. Returns JPEG bytes."""
