@@ -176,13 +176,16 @@ class Sync:
     def watch_count(self):
         return self.db.scalar("SELECT COUNT(*) FROM watchlist WHERE " + self._LIVE, (self._now_ms(),))
 
-    def outbox_count(self):
+    def outbox_count(self, kind=None):
+        if kind:
+            return self.db.scalar("SELECT COUNT(*) FROM outbox WHERE kind=?", (kind,))
         return self.db.scalar("SELECT COUNT(*) FROM outbox")
 
     def reset_cache(self):
         self.db.q("DELETE FROM watchlist")
         self._aliases = None
         self.db.put("sync_state", {})
+        self.db.put("acked", {})
         self._seen_sightings = []
 
     # ------------------------------------------------------------ talking to the backend
@@ -191,14 +194,14 @@ class Sync:
         t = self.clock()
         for oid, kind, payload, created, tries, next_try in self.db.q("SELECT * FROM outbox ORDER BY id"):
             age = t - created
-            if (kind == "sighting" and age > COOLDOWN) or (kind == "flag" and age > FLAG_MAX_AGE) \
+            if (kind == "receipt" and age > 86400) or (kind == "sighting" and age > COOLDOWN) or (kind == "flag" and age > FLAG_MAX_AGE) \
                     or (kind == "evidence" and age > EVIDENCE_MAX_AGE):
                 self.db.q("DELETE FROM outbox WHERE id=?", (oid,))      # too old to be useful / the rules would refuse it
                 continue
             if next_try > t:
                 continue
             try:
-                self.cloud.call({"flag": "submitFlag", "evidence": "submitEvidence"}.get(kind, "reportSighting"), json.loads(payload))
+                self.cloud.call({"flag": "submitFlag", "evidence": "submitEvidence", "receipt": "ackReceipt"}.get(kind, "reportSighting"), json.loads(payload))
             except CloudError as e:
                 if e.code in PERMANENT:
                     log.warning("dropping a queued %s the backend rejected (%s)", kind, e.code)
@@ -228,6 +231,7 @@ class Sync:
         if not out.get("unchanged"):
             self._apply(out.get("players", []), out.get("fullList", False))
             meta = out.get("metaRev", meta)
+        self._send_receipts()
         since = out.get("nextSince", since)
         s_since = out.get("sightingsNext", s_since)
         sightings += out.get("sightings", [])
@@ -254,6 +258,23 @@ class Sync:
                     p.get("severity", "normal"), p.get("reviewBy"), p.get("updatedAt", 0), json.dumps(_clean_looks(p.get("looks")))))
             else:
                 self.db.q("DELETE FROM watchlist WHERE user_id=?", (uid,))
+
+    ACK_EVERY = 25 * 86400       # receipts lapse after 30 days on the backend, so refresh them a little before that
+
+    def _send_receipts(self):
+        """Tell the backend this device now has each live entry ("received"). Only the Roblox id is sent: reviewers see a
+        COUNT of devices, never which device, who owns it or where it is. Sent once per entry, and again after 25 days."""
+        acked = self.db.get("acked", {}) or {}
+        t = self.clock()
+        live = self.watch_ids()
+        acked = {k: v for k, v in acked.items() if k in live}               # dropped from the list: forget it, so a later relisting is acknowledged again
+        sent = 0
+        for uid in sorted(live):
+            if t - acked.get(uid, 0) > self.ACK_EVERY and sent < 20:         # a few per round, so a long list can't crowd out queued flags
+                self._enqueue("receipt", {"userId": uid})
+                acked[uid] = t
+                sent += 1
+        self.db.put("acked", acked)
 
     def _alerts_from_others(self, sightings, server_time):
         for s in sightings:

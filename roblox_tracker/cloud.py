@@ -246,6 +246,19 @@ class Cloud:
                  "updateTransforms": [{"fieldPath": f, "setToServerValue": "REQUEST_TIME"} for f in server_time]}
         self._fs(":commit", {"writes": [write]})
 
+    def _upsert(self, path, fields, server_time=("at",)):
+        """Create the document or replace its fields (no 'must not exist' check). Used for delivery receipts."""
+        write = {"update": {"name": self._name(path), "fields": {k: enc(v) for k, v in fields.items()}},
+                 "updateTransforms": [{"fieldPath": f, "setToServerValue": "REQUEST_TIME"} for f in server_time]}
+        self._fs(":commit", {"writes": [write]})
+
+    def _ack(self, d):
+        """'This device has received the entry for <userId>.' Only the Roblox id, the account id and the time: no location,
+        no device name. Reviewers see a count. One document per account and player, so repeating it just replaces it."""
+        uid = str(d["userId"])
+        self._upsert(f"receipts/{uid}_{self.uid}", {"userId": uid, "uid": self.uid, "expireAt": Ts(int(self.clock() * 1000) + 30 * DAY_MS)})
+        return {"recorded": True}
+
     def refresh_role(self):
         """Look up this account's role; the first time ever, ask for access (role 'pending') so an admin can approve."""
         path = f"moderators/{self.uid}"
@@ -267,7 +280,7 @@ class Cloud:
             raise CloudError("permission-denied", "This account hasn't been approved yet.")
         try:
             return {"submitFlag": self._submit_flag, "reportSighting": self._report_sighting,
-                    "submitEvidence": self._submit_evidence, "syncWatchlist": self._sync}[name](data)
+                    "submitEvidence": self._submit_evidence, "syncWatchlist": self._sync, "ackReceipt": self._ack}[name](data)
         except CloudError as e:
             if e.code == "permission-denied" and name != "syncWatchlist":
                 # Either the account lost access, or the rules refused this one item (e.g. the player is no longer on
