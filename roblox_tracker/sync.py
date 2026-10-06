@@ -33,12 +33,36 @@ def source_of(src):
     return "lexicon" if s.startswith("lex") else "ai" if s.startswith("ai") else "manual"
 
 
+def encode_look(look):
+    """64 small integers -> one base64 string. Firestore doesn't allow a list inside a list, so a list of outfit fingerprints is
+    stored as a list of these strings."""
+    import base64
+    return base64.b64encode(bytes(max(0, min(127, int(x))) for x in look)).decode()
+
+
+def decode_look(v):
+    """A stored fingerprint (base64 string, or an older plain list) -> list of 64 ints 0-127, or None if it isn't one."""
+    import base64
+    try:
+        if isinstance(v, str):
+            raw = base64.b64decode(v, validate=True)
+            vals = list(raw)
+        elif isinstance(v, list) and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v):
+            vals = [int(x) for x in v]
+        else:
+            return None
+    except Exception:
+        return None
+    return [max(0, min(127, x)) for x in vals] if len(vals) == 64 else None
+
+
 def _clean_looks(looks):
     """At most 3 fingerprints of exactly 64 small integers; anything else is ignored (the list is shared, so don't trust it)."""
     out = []
     for v in (looks if isinstance(looks, list) else [])[:3]:
-        if isinstance(v, list) and len(v) == 64 and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v):
-            out.append([max(0, min(127, int(x))) for x in v])
+        d = decode_look(v)
+        if d is not None:
+            out.append(d)
     return out
 
 

@@ -4,7 +4,7 @@ import re
 from .config import CORNERS, MODEL, OLLAMA, OV_SHARE, OV_TOP
 
 DEFAULTS = {
-    "monitor": 0, "auto": True, "interval": 2, "ai_on": True, "sens": 80, "discover": True,
+    "monitor": 0, "auto": True, "interval": 2, "ai_on": True, "sens": 80, "discover": True, "roblox_only": True,
     "ov_mode": OV_TOP, "hud": CORNERS[0], "ov_flags": True, "show_sus": False,
     "geometry": "1150x680", "ollama": OLLAMA, "model": MODEL, "tray": False, "setup_done": False,
     "auto_update": True, "last_update_check": 0, "skip_version": "",

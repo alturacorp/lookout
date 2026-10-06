@@ -20,7 +20,7 @@ import numpy as np
 from PIL import Image, ImageTk
 from rapidocr_onnxruntime import RapidOCR
 
-from . import build_info, config, dialogs, icons, paths, teach, theme, tray, updater
+from . import build_info, config, dialogs, icons, nametag, paths, teach, theme, tray, updater, window
 from . import cloud as cloud_mod
 from . import prefs as prefs_mod
 from .ai import Clf, verdict
@@ -57,6 +57,7 @@ class App:
         self.ai_on = tk.BooleanVar(root, value=p["ai_on"])
         self.sens = tk.IntVar(root, value=p["sens"])
         self.discover = tk.BooleanVar(root, value=p["discover"])
+        self.roblox_only = tk.BooleanVar(root, value=p["roblox_only"])
         self.auto_add = tk.BooleanVar(root, value=p["auto_add"])
         self.overlay_on = tk.BooleanVar(root, value=False)       # always starts off
         self.show_sus = tk.BooleanVar(root, value=p["show_sus"])
@@ -66,12 +67,12 @@ class App:
         self.search = tk.StringVar(root)
         # Worker threads must not touch Tk variables. They read this plain copy, which the UI thread keeps current.
         self.opt = types.SimpleNamespace(auto=p["auto"], interval=p["interval"], discover=p["discover"], ai_on=p["ai_on"],
-                                          sens=p["sens"], mon=0)
-        for k in ("auto", "interval", "discover", "ai_on", "sens"):
+                                          sens=p["sens"], mon=0, roblox_only=p["roblox_only"])
+        for k in ("auto", "interval", "discover", "ai_on", "sens", "roblox_only"):
             getattr(self, k).trace_add("write", lambda *_, k=k: self._mirror(k))
         # pref key -> Tk variable, saved automatically whenever one changes
         self.pref_vars = {"auto": self.auto, "interval": self.interval, "ai_on": self.ai_on, "sens": self.sens,
-                          "discover": self.discover, "auto_add": self.auto_add, "show_sus": self.show_sus, "ov_flags": self.ov_flags,
+                          "discover": self.discover, "roblox_only": self.roblox_only, "auto_add": self.auto_add, "show_sus": self.show_sus, "ov_flags": self.ov_flags,
                           "ov_mode": self.ov_mode, "hud": self.hud_corner}
 
         # ---- persisted settings
@@ -83,10 +84,10 @@ class App:
         # ---- runtime state (everything the scan thread touches must exist before the threads start)
         self.live, self.sel, self.track = set(), None, {}
         self._tabs_sig, self._restoring = None, False
-        self.names, self.pend, self.scan_n = set(), {}, 0
+        self.names, self.pend, self.scan_n, self.plates = set(), {}, 0, []
         self._sk, self.tag_seen, self.rr_left = None, set(), 0
         self.last_auto, self.fz, self.f1_t = {}, None, 0
-        self.ocr, self.teach_ocr = None, None              # scan-thread OCR engine / F1 window's own engine
+        self.ocr, self.teach_ocr, self._why = None, None, None              # scan-thread OCR engine / F1 window's own engine
         self.ov, self.ov_idx, self.ov_rects, self.ov_scene, self.ov_hud = None, None, [], None, None
         self.list_zones, self.cands = ListZones(), Candidates()      # leaderboards found on screen; names not yet players
         self.cand_state, self.cand_retry = {}, {}                    # name -> pending|ok|no|verified|error
@@ -183,6 +184,7 @@ class App:
         self.switch(g, "Auto-scan every", self.auto).pack(side="left", padx=(10, 4))
         ttk.Spinbox(g, from_=1, to=30, width=3, textvariable=self.interval).pack(side="left")
         ttk.Label(g, text="s").pack(side="left", padx=(2, 8))
+        self.switch(g, "Roblox window only", self.roblox_only, self.trigger.set).pack(side="left", padx=(0, 8))
         B(g, "Scan now", self.trigger.set, "scan", accent=True).pack(side="left", padx=2)
         B(g, "Teach (F1)", self.freeze, "teach").pack(side="left", padx=2)
         g = group(bar, "Finding players")
@@ -757,18 +759,57 @@ class App:
                 if not (forced or self.opt.auto):
                     continue
                 try:
-                    frame = np.array(sct.grab(sct.monitors[self.opt.mon + 1]))[:, :, :3]
+                    mon = sct.monitors[self.opt.mon + 1]
+                    frame = np.array(sct.grab(mon))[:, :, :3]
+                    area, why = self.game_area(mon)
+                    if why:
+                        if why != self._why:
+                            self._why = why
+                            self.root.after(0, lambda m=why: self.status.config(text=m))
+                        last_sig = None
+                        continue
+                    self._why = None
+                    if area:                                       # keep only the Roblox window: everything else is blanked
+                        frame = self.keep_area(frame, area)
                     sig = frame_sig(frame)
                     # A screen that hasn't changed has nothing new to read. Re-read at least every 20 s anyway.
                     if not forced and same_frame(sig, last_sig) and time.time() - last_full < 20:
                         continue
                     last_sig, last_full = sig, time.time()
-                    res, _ = ocr(frame)
+                    if area:
+                        res, _ = ocr(frame[area[1]:area[3], area[0]:area[2]])      # read only the game picture, then move the boxes back
+                        res = window.shift(res, area[0], area[1])
+                    else:
+                        res, _ = ocr(frame)
                     with self.db.batch():
                         self.process(frame, res or [])
                 except Exception as e:
                     self.log_error("scan", "scan failed")
                     self.root.after(0, lambda e=e: self.status.config(text=f"Error: {e}"))
+
+    @staticmethod
+    def keep_area(frame, area):
+        """A copy of `frame` where everything outside area (x1, y1, x2, y2) is black, so nothing outside the game window is read.
+        Same size as the input, so every position in it is still a position on the monitor."""
+        x1, y1, x2, y2 = area
+        out = np.zeros_like(frame)
+        out[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
+        return out
+
+    def game_area(self, mon):
+        """(area, problem). area = (x1, y1, x2, y2) of the Roblox window on this monitor, in the monitor's own pixels, or None to read the
+        whole monitor. problem is a message when Roblox-only is on but the window can't be used (nothing is scanned then)."""
+        if not self.opt.roblox_only:
+            return None, None
+        if not window.supported():
+            return None, None                                   # no way to find the window on this system: read the monitor as before
+        rect = window.find_roblox()
+        if rect is None:
+            return None, "Roblox window not found (open Roblox and keep it visible), or turn off 'Roblox window only'"
+        area = window.clip_to_monitor(rect, mon)
+        if area is None:
+            return None, "The Roblox window isn't on the monitor being scanned. Pick the monitor it is on."
+        return area, None
 
     def process(self, frame, res):
         self.scan_n += 1
@@ -779,6 +820,19 @@ class App:
         self.frame_shape = frame.shape
         self._frame_ref = frame                                  # the latest frame, only so an alert can crop evidence from it
         boxes, words, alias_c = [], [], []
+        # Name plates ("SGT. R. Emerson" over "Combat - Turn-Based" / "View Player"): the name is an in-game name, and the smaller lines
+        # under it are status text, not players. (Our own overlay is left out first.)
+        ours = [(b, t, c) for b, t, c in res if float(c) >= MIN_CONF and not self.mostly_inside(
+            (int(b[0][0]), int(b[0][1]), int(b[2][0]), int(b[2][1])), ov)]
+        plates = nametag.find_plates(ours, MIN_CONF)
+        plate_skip = [ln for p in plates for ln in p["lines"][1:]]
+        for p in plates:
+            for form in nametag.match_forms(p["name"]):
+                hit = self.sync.alias_match(form)
+                if hit:
+                    alias_c.append((hit, p["box"]))
+                    break
+        self.plates = plates
         for b, text, conf in res:
             conf = float(conf)
             if conf < MIN_CONF:
@@ -788,6 +842,8 @@ class App:
                 continue                                    # that's our own overlay / HUD / share window
             if any(r[0] <= x1 and r[1] <= y1 and x2 <= r[2] and y2 <= r[3] for r in rects):
                 boxes.append(((y1 + y2) / 2, x1, y2 - y1, text.strip()))
+            elif self.mostly_inside((x1, y1, x2, y2), plate_skip):
+                continue                                    # a status line of a name plate, not a player
             else:
                 t = text.strip().lstrip("@")
                 hit = self.sync.alias_match(t)

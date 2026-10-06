@@ -31,64 +31,62 @@ N_FEAT = 1 << 14
 OV_TOP, OV_SHARE = "On top of game", "Share view (mirror)"
 CORNERS = ["Bottom-right", "Bottom-left", "Top-right", "Top-left", "Off"]
 
-# too noisy for a 1B model; lexicon patterns still cover them
-DEFAULT_AI_OFF = {"profanity", "spam", "bullying", "harassment"}
+# The flag categories are the section names of Cardea's Incident Classification Schedule (the same list is in firestore.rules,
+# the dashboard, the LATTICE forms and the bridge). A 1B model is too noisy to guess most of them from chat, so by default the AI
+# only suggests the ones below; the built-in patterns (further down) and your lexicon.json always apply.
+DEFAULT_AI_ON = {"offences_against_persons", "commerce_labour_and_finance", "digital_data_and_ai", "organised_crime"}
 
 CATS = {
-    "racism": "racial slurs, racial stereotypes or hate toward an ethnicity",
-    "antisemitism": "hate or conspiracy talk targeting Jewish people",
-    "xenophobia": "hate toward nationalities, immigrants or foreigners",
-    "religious_hate": "hate toward a religion or its followers",
-    "homophobia": "slurs or hate toward gay, lesbian or bisexual people",
-    "transphobia": "slurs, mockery or hate toward trans or nonbinary people",
-    "sexism": "misogyny, gender-based insults, demeaning women or men",
-    "ableism": "mocking disability or using disability slurs as insults",
-    "harassment": "targeted insults or persistent hostility toward a person",
-    "bullying": "pile-ons, humiliation, exclusion, mocking a specific player",
-    "threats": "threats of violence, swatting or real-world harm",
-    "doxxing": "sharing or demanding personal info, addresses, IPs",
-    "self_harm_encouragement": "telling someone to hurt or kill themselves",
-    "sexual_content": "sexual or explicit talk or roleplay",
-    "predatory_behaviour": "asking age/photos, moving to private chats, secrecy, grooming signs",
-    "scam": "free-Robux offers, fake trades, phishing, account stealing",
-    "offsite_links": "invites or links to Discord, Telegram or other sites",
-    "extremism": "extremist, terrorist or hate-group content",
-    "spam": "repeated advertising or flooding",
-    "exploiting": "cheating, exploit scripts, ban-evasion talk",
-    "profanity": "strong swearing not aimed at a protected group",
+    "cardea_penalty_notices": "minor on-the-spot offences: noise, loitering, queue jumping, defacing, fare evasion",
+    "threshold_and_district_2_access": "trying to pass the checkpoint without valid credentials, sharing or faking passes, obstructing the threshold",
+    "offences_against_cardea": "abuse, threats or obstruction toward Cardea officers, posts, vehicles or equipment",
+    "offences_against_persons": "violence, threats of harm, exploitation, grooming, persistent harassment or telling someone to hurt themselves",
+    "property_and_assets": "theft, damage, trespass or occupying someone else's property",
+    "weapons_and_arms": "possessing, carrying, using, making or supplying weapons, armour or explosives",
+    "narcotics_and_stims": "dealing or using controlled substances, combat stims or neuro-chems",
+    "commerce_labour_and_finance": "fraud, scams, rackets, illegal lending, unlicensed trade or workforce abuse",
+    "digital_data_and_ai": "hacking, sharing or demanding personal info, deepfakes, drones or interfering with Cardea's safety systems",
+    "body_cyberware_and_neural": "illegal implants or augmentation, misuse of neural recordings or simulation",
+    "public_order_and_streets": "disorder, riots, curfew breaches, flooding the chat or other disruption of the district",
+    "expression_media_and_culture": "unlicensed press, broadcast, performance, education or public messaging",
+    "surveillance_and_compliance": "refusing identification or scanning, failing to register, not cooperating with Cardea's safety systems",
+    "residence_family_and_identity": "homes, households, forged identity records, animals, births and deaths",
+    "vehicles_transit_and_infrastructure": "superway, road, tunnel or lift offences, vehicle misuse",
+    "environment_utilities_and_health": "air, water, power, waste or public health offences",
+    "justice_and_custody": "escaping custody, tampering with evidence, intimidating witnesses, interfering with the court process",
+    "organised_crime": "organised criminal groups, rackets, corruption, proscribed or extremist organisations",
+    "emergency_and_lockdown": "offences that only exist, or get worse, while a district lockdown is in force",
+    "internal_conduct": "misconduct by Cardea staff (staff only; handled by Workforce Integrity)",
 }
+DEFAULT_AI_OFF = set(CATS) - DEFAULT_AI_ON
 
-# Built-in patterns for the non-slur categories. Add your own (slurs etc.) in lexicon.json.
+# Built-in patterns. Add your own in lexicon.json (use the category names above).
 BUILTIN = {
-    "scam": [r"free\s*robux", r"robux\s*generator", r"verify.{0,20}(group|link|account)"],
-    "offsite_links": [r"discord\.gg/", r"\bt\.me/", r"https?://"],
-    "predatory_behaviour": [r"how old are (you|u)\b", r"\basl\b", r"send (me )?(a )?(pic|photo)s?",
-                            r"(add|dm) me on (snap|insta|discord|telegram)", r"don'?t tell (your )?(mom|dad|parents)"],
-    "self_harm_encouragement": [r"\bkys\b", r"kill yourself"],
-    "threats": [r"i'?ll (find|hurt|kill) you", r"\bswat(ting)?\b"],
-    "doxxing": [r"\bdox(x?ed|x?ing)?\b", r"your (ip|address) is"],
+    "commerce_labour_and_finance": [r"free\s*robux", r"robux\s*generator", r"verify.{0,20}(group|link|account)"],
+    "offences_against_persons": [r"how old are (you|u)\b", r"\basl\b", r"send (me )?(a )?(pic|photo)s?",
+                                 r"(add|dm) me on (snap|insta|discord|telegram)", r"don'?t tell (your )?(mom|dad|parents)",
+                                 r"\bkys\b", r"kill yourself", r"i'?ll (find|hurt|kill) you", r"\bswat(ting)?\b"],
+    "digital_data_and_ai": [r"\bdox(x?ed|x?ing)?\b", r"your (ip|address) is"],
 }
 
 # A 1B model is a bad judge of its own confidence, so for the touchy categories it may only flag a message that
 # also contains a cue word (or that your own trained model agrees with). Pattern/lexicon flags are unaffected.
 CUES = {
-    "predatory_behaviour": r"\b(age|old|asl|pics?|photos?|selfies?|snap(chat)?|insta(gram)?|discord|telegram|kik|whatsapp|"
-                           r"tiktok|dm|private|secret|alone|meet|cam|nudes?|address|school|phone|number|home|parents?|mom|"
-                           r"dad|boyfriend|girlfriend|bf|gf|cute|pretty|sexy|body)\b",
-    "sexual_content": r"\b(sex\w*|nudes?|naked|porn\w*|horny|lewd|erp|strip\w*|kiss\w*|bikini)\b",
-    "doxxing": r"\b(ip|address|lives? at|phone|number|real name|school|dox\w*|swat\w*|location|street)\b",
-    "threats": r"(find you|your (house|home|address|school|ip)|swat|\birl\b|real life|come to your|hurt you|kill you|bomb|shoot up|stab)",
-    "self_harm_encouragement": r"\b(kys|kill (yourself|urself)|die|suicide|hang|jump off|rope|end it)\b",
-    "scam": r"\b(robux|free|giveaway|generator|verify|password|login|link|profile|bio|click|code|claim)\b",
-    "offsite_links": r"(discord|telegram|t\.me|https?|www\.|\.com|\.gg|snap|insta|tiktok|youtube)",
+    "offences_against_persons": r"(\b(age|old|asl|pics?|photos?|selfies?|snap(chat)?|insta(gram)?|discord|telegram|kik|whatsapp|"
+                                r"tiktok|dm|private|secret|alone|meet|cam|nudes?|address|school|phone|number|home|parents?|mom|"
+                                r"dad|boyfriend|girlfriend|bf|gf|cute|pretty|sexy|body|kys|kill (yourself|urself)|die|suicide|hang|"
+                                r"jump off|rope|end it|swat\w*)\b|find you|your (house|home|address|school|ip)|\birl\b|real life|"
+                                r"come to your|hurt you|kill you|bomb|shoot up|stab)",
+    "digital_data_and_ai": r"\b(ip|address|lives? at|phone|number|real name|school|dox\w*|swat\w*|location|street)\b",
+    "commerce_labour_and_finance": r"\b(robux|free|giveaway|generator|verify|password|login|link|profile|bio|click|code|claim)\b",
 }
 
 # Few-shot examples that are always shown to the model and always used to train the on-device classifier.
 SEEDS = [
     ("gg wp", "none"), ("anyone want to trade?", "none"), ("lol that was so funny", "none"),
     ("hello everyone", "none"), ("this game is trash lol", "none"), ("where do i go next", "none"),
-    ("free robux go to my profile and click the link", "scam"), ("kys", "self_harm_encouragement"),
-    ("how old are you? send me a pic", "predatory_behaviour"), ("i will find you and hurt you", "threats"),
+    ("free robux go to my profile and click the link", "commerce_labour_and_finance"), ("kys", "offences_against_persons"),
+    ("how old are you? send me a pic", "offences_against_persons"), ("i will find you and hurt you", "offences_against_persons"),
     ("yh gimme a gun imma beat yo ahh", "none"), ("imma get u back lol", "none"),
     ("bro you are so bad lmao", "none"), ("give me your sword", "none"),
     ("i will destroy you in this game", "none"), ("add me as a friend", "none"),
@@ -100,7 +98,7 @@ PROMPT = ("You help a Roblox player keep notes on other players. The chat line b
           "so it may be garbled, cut off or just a random word. Most Roblox chat is harmless kid banter. These are NOT "
           'violations: greetings, game talk, jokes, trash talk, in-game fighting or roleplay ("beat you", "gimme a gun", '
           '"i\'ll get you"), slang ("ahh", "bro", "yh"), mild swearing, typos. Threats only count when they are about '
-          "real-world harm. predatory_behaviour only counts when the message asks a person for their age, photos or "
+          "real-world harm. offences_against_persons (grooming) only counts when the message asks a person for their age, photos or "
           "personal details, asks them to move to a private app, or asks them to keep a secret. Do not guess from a "
           "username. When unsure, answer none.\nCategories:\n"
           + "\n".join(f"- {k}: {v}" for k, v in CATS.items())
@@ -114,4 +112,4 @@ def now():
 
 
 # Keep in step with highSeverity() in firebase/firestore.rules and HIGH_SEVERITY in the dashboard's config.js.
-HIGH_SEVERITY = ("predatory_behaviour", "threats", "doxxing", "self_harm_encouragement", "extremism", "sexual_content")
+HIGH_SEVERITY = ("offences_against_persons", "weapons_and_arms", "organised_crime", "internal_conduct")

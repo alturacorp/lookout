@@ -335,7 +335,8 @@ class Cloud:
              "confidence": float(d["confidence"]), "image": Bytes(img), "deviceId": d["deviceId"], "reporter": self.uid,
              "expireAt": Ts(now_ms + 30 * DAY_MS)}
         if d.get("look"):
-            f["look"] = [int(x) for x in d["look"]]
+            from .sync import encode_look
+            f["look"] = encode_look(d["look"])                  # one string: matches what a reviewer's reference will be stored as
         try:
             self._create(f"evidence/{eid}", f)
         except CloudError as e:
